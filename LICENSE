@@ -1,0 +1,37 @@
+MIT License
+
+Copyright (c) 2025 NetSentinel contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+Ethical use notice
+
+NetSentinel is a defensive monitoring tool.  It captures packets on a network
+interface, which means it can observe traffic that is not addressed to the
+machine running it when the interface is in promiscuous mode.  You must only
+run NetSentinel on:
+
+  * Networks that you own, or
+  * Networks on which you have explicit written authorisation to monitor.
+
+Unauthorised packet capture may violate computer-misuse, wiretapping, privacy
+and telecommunications laws in your jurisdiction.  The authors of NetSentinel
+accept no liability for misuse of this software.

@@ -1,0 +1,66 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Testing / tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- NetSentinel runtime output ---
+# Generated reports, alerts and logs must never be committed: they can
+# contain real network metadata.  Only the .gitkeep placeholder in each
+# directory is tracked.
+reports/*
+!reports/.gitkeep
+alerts/*
+!alerts/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# --- Local data ---
+# A locally captured baseline reflects the traffic on *your* lab and may
+# reveal internal hostnames and addresses.  Do not commit it.
+data/*
+!data/.gitkeep
+
+# --- Captures ---
+# Never commit real packet captures.  If you must ship a sample, generate a
+# synthetic one from the test suite instead.
+*.pcap
+*.pcapng
+*.cap
+
+# --- Local config overrides ---
+# Keep config.json under version control as the documented default, but
+# ignore any personal overrides.
+config.local.json
+
+# --- OS noise ---
+.DS_Store
+Thumbs.db

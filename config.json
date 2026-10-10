@@ -1,0 +1,222 @@
+'''Shared, dependency-free helpers for NetSentinel.
+Only small generic utilities belong here: UTC time handling, address
+normalisation, identifier generation and thread-safe file helpers.
+Detection logic lives in :mod:`alert_manager`; parsing lives in
+:mod:`parsers`.
+'''
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import re
+import threading
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, List, Optional
+
+# MAC addresses are normalised to lowercase, colon-separated form.
+_MAC_COLON_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
+_MAC_BARE_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+class NetSentinelError(Exception):
+    """Base class for all NetSentinel-specific errors."""
+
+
+# --------------------------------------------------------------------------
+# Time helpers.  All exported timestamps are ISO-8601 in UTC with a 'Z' suffix.
+# --------------------------------------------------------------------------
+
+def utc_now() -> datetime:
+    """Return the current timezone-aware UTC datetime."""
+    return datetime.now(timezone.utc)
+
+
+def to_utc_iso(value: Any) -> str:
+    """Normalise ``value`` to an ISO-8601 UTC string ending in ``Z``.
+
+    Accepts a :class:`datetime`, an epoch number (int/float) or an ISO-8601
+    string.  Naive datetimes are assumed to already be UTC.
+    """
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+    elif isinstance(value, bool):
+        raise TypeError("Booleans are not valid timestamps")
+    elif isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+    else:
+        raise TypeError(f"Unsupported timestamp type: {type(value)!r}")
+
+    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def utc_now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string."""
+    return to_utc_iso(utc_now())
+
+
+def epoch_now() -> float:
+    """Return the current UTC time as epoch seconds."""
+    return utc_now().timestamp()
+
+
+# --------------------------------------------------------------------------
+# Address helpers
+# --------------------------------------------------------------------------
+
+def normalize_ip(value: Any) -> Optional[str]:
+    """Return a canonical textual IP address, or ``None`` if invalid.
+
+    Uses :mod:`ipaddress` so that IPv6 addresses are compressed consistently
+    and leading zeros are rejected rather than silently reinterpreted.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    # Scapy renders some addresses with a trailing scope id such as '%eth0'.
+    if "%" in text:
+        text = text.split("%", 1)[0]
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return None
+
+
+def normalize_mac(value: Any) -> Optional[str]:
+    """Return a canonical lowercase colon-separated MAC address or ``None``."""
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("-", ":")
+    if _MAC_COLON_RE.match(text):
+        return text
+    if _MAC_BARE_RE.match(text):
+        return ":".join(text[i:i + 2] for i in range(0, 12, 2))
+    return None
+
+
+def ip_in_networks(ip: Optional[str], networks: Iterable[str]) -> bool:
+    """Return ``True`` if ``ip`` falls inside any of ``networks``.
+
+    Invalid entries in ``networks`` are ignored; configuration validation is
+    responsible for rejecting them earlier.
+    """
+    if ip is None:
+        return False
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+
+    for entry in networks:
+        try:
+            network = ipaddress.ip_network(str(entry), strict=False)
+        except ValueError:
+            continue
+        # Comparing versions avoids the TypeError raised by mixed families.
+        if address.version == network.version and address in network:
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# Identifier and serialisation helpers
+# --------------------------------------------------------------------------
+
+def generate_id(prefix: str = "alert") -> str:
+    """Return a short, unique, human-readable identifier."""
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def _json_default(obj: Any) -> Any:
+    """Fallback serialiser for objects :mod:`json` cannot handle natively."""
+    if isinstance(obj, (set, frozenset)):
+        return sorted(obj, key=str)
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, datetime):
+        return to_utc_iso(obj)
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    return repr(obj)
+
+
+def dumps_json(obj: Any, **kwargs: Any) -> str:
+    """Serialise ``obj`` to JSON with NetSentinel's fallback handling."""
+    kwargs.setdefault("default", _json_default)
+    kwargs.setdefault("ensure_ascii", False)
+    return json.dumps(obj, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# File helpers
+# --------------------------------------------------------------------------
+
+def ensure_dir(path: Any) -> Path:
+    """Create ``path`` (and parents) if needed and return it as a Path."""
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def atomic_write_text(path: Any, text: str, encoding: str = "utf-8") -> Path:
+    """Write ``text`` to ``path`` via a temporary file and an atomic rename.
+
+    Prevents a partially written report or baseline from being left behind if
+    the process is interrupted mid-write.
+    """
+    target = Path(path)
+    ensure_dir(target.parent)
+    temp = target.with_name(target.name + ".tmp")
+    temp.write_text(text, encoding=encoding)
+    temp.replace(target)
+    return target
+
+
+def truncate_text(value: str, limit: int = 200) -> str:
+    """Return ``value`` shortened to ``limit`` characters with an ellipsis."""
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)] + "..."
+
+
+class FileAppender:
+    """Thread-safe, append-only line writer.
+
+    A single lock guards all writes so concurrent producers (for example a
+    capture thread and a shutdown-time flush) cannot interleave partial lines.
+    Errors propagate to the caller; they are never swallowed.
+    """
+
+    def __init__(self, path: Any) -> None:
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    def append(self, line: str) -> None:
+        """Append one line, adding a trailing newline when missing."""
+        with self._lock:
+            ensure_dir(self.path.parent)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+                if not line.endswith("\n"):
+                    handle.write("\n")
+
+    def read_lines(self) -> List[str]:
+        """Return previously written lines, or an empty list if absent."""
+        if not self.path.exists():
+            return []
+        return self.path.read_text(encoding="utf-8").splitlines()

@@ -1,0 +1,15 @@
+# NetSentinel runtime dependencies.
+#
+# Scapy is the only external dependency.  It is used for packet capture and
+# protocol dissection only.  The version range is deliberately broad because
+# Scapy's public API for the layers we use (Ether, IP, TCP, UDP, ICMP, ARP,
+# DNS) has been stable across the 2.5.x and 2.6.x series.  If installation
+# fails on your platform, pin to a version known to work there and document
+# the change in your local fork.
+#
+# Install with:
+#     python -m pip install -r requirements.txt
+#
+# Verify the installed version with:
+#     python -c "import scapy; print(scapy.__version__)"
+scapy>=2.5.0,<2.7
