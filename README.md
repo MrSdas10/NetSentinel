@@ -156,7 +156,7 @@ sudo apt-get update
 sudo apt-get install python3 python3-pip python3-venv python3-dev libpcap-dev git
 
 # 2. Clone the repository
-git clone https://github.com/YOUR_USERNAME/NetSentinel.git
+git clone https://github.com/MrSdas10/NetSentinel
 cd NetSentinel
 
 # 3. Create and activate a virtual environment
