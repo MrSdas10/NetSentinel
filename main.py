@@ -1,459 +1,481 @@
-"""NetSentinel command-line entry point.
-
-Wires together configuration, capture, parsing, baseline, detection and
-reporting.  All heavy lifting lives in the other modules; this file is
-responsible for argument parsing, orchestration, console output and exit
-codes.
 """
+main.py — NetSentinel application entry point.
 
-from __future__ import annotations
+Implements the command-line interface and wires together all modules.
+
+Usage examples
+--------------
+    python main.py --help
+    python main.py --list-interfaces
+    python main.py --show-config
+    python main.py --interface eth0
+    python main.py --interface eth0 --duration 60
+    python main.py --interface eth0 --duration 60 --report
+    python main.py --offline captures/lab.pcap
+    python main.py --offline captures/lab.pcap --report
+
+Exit codes
+----------
+    0  Successful execution.
+    1  Invalid arguments or incompatible options.
+    2  Configuration error.
+    3  Capture or I/O error.
+    4  Permission denied (live capture).
+"""
 
 import argparse
 import logging
 import signal
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
-from alert_manager import AlertManager, AlertStore, build_rules_from_config
-from baseline import BaselineError, BaselineManager
-from capture import CaptureEngine, CaptureError, CaptureStats, SCAPY_AVAILABLE
-from config_loader import ConfigError, load_config, output_path
-from parsers import describe_packet
-from reporter import ReportError, ReportGenerator
-from utils import ensure_dir, utc_now_iso
+# ---------------------------------------------------------------------------
+# Project root — all relative paths are resolved from here.
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).parent.resolve()
+CONFIG_PATH = PROJECT_ROOT / "config.json"
 
-LOGGER = logging.getLogger("netsentinel")
-
-# Exit codes: 0 success, 1 runtime error, 2 invalid CLI usage.
-EXIT_OK = 0
-EXIT_RUNTIME_ERROR = 1
-EXIT_USAGE_ERROR = 2
+# Exit codes
+EXIT_OK          = 0
+EXIT_ARG_ERROR   = 1
+EXIT_CONFIG_ERROR = 2
+EXIT_IO_ERROR    = 3
+EXIT_PERMISSION  = 4
 
 
-# --------------------------------------------------------------------------
-# Logging setup
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Logging bootstrap (before config is loaded)
+# ---------------------------------------------------------------------------
 
-def _configure_logging(level: str, log_dir: Path) -> None:
-    """Send INFO+ to the console and DEBUG+ to a rotating file."""
+def _bootstrap_logging(level: str = "INFO") -> None:
+    """Configure console logging before the config file is read."""
     numeric = getattr(logging, level.upper(), logging.INFO)
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
-
-    console = logging.StreamHandler(stream=sys.stderr)
-    console.setLevel(numeric)
-    console.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
-    root.addHandler(console)
-
-    try:
-        ensure_dir(log_dir)
-        file_handler = logging.FileHandler(
-            log_dir / "netsentinel.log", encoding="utf-8"
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s: %(message)s"
-        ))
-        root.addHandler(file_handler)
-    except OSError as exc:
-        # A failed log file must not stop the tool from running; the console
-        # handler still works and the user sees the warning.
-        LOGGER.warning("Could not open log file in %s: %s", log_dir, exc)
+    logging.basicConfig(
+        level=numeric,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+        stream=sys.stderr,
+    )
 
 
-# --------------------------------------------------------------------------
-# Argument parsing
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
 
-def build_parser() -> argparse.ArgumentParser:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="netsentinel",
         description=(
-            "NetSentinel - real-time network threat detection and anomaly "
-            "monitoring. Defensive monitoring only."
+            "NetSentinel — Real-Time Network Threat Detection and Anomaly "
+            "Monitoring System.\n\n"
+            "A defensive passive NIDS for authorized networks. "
+            "Do not use on networks you do not own or have written permission "
+            "to monitor."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  python main.py --list-interfaces\n"
-            "  python main.py --show-config\n"
-            "  python main.py --offline capture.pcap --report\n"
-            "  sudo python main.py --interface eth0 --duration 60 --report\n"
+            "  python main.py --interface eth0 --duration 60 --report\n"
+            "  python main.py --offline captures/lab.pcap --report\n"
         ),
     )
 
+    # Mode selection (mutually exclusive)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
-        "--interface", "-i", metavar="IFACE",
-        help="Capture live packets on IFACE (requires elevated privileges on most systems).",
+        "--interface", "-i",
+        metavar="IFACE",
+        help="Network interface for live capture (requires elevated privileges).",
     )
     mode.add_argument(
-        "--offline", metavar="PCAP",
-        help="Analyse packets from an existing PCAP file (no privileges required).",
+        "--offline", "-o",
+        metavar="PCAP_FILE",
+        help="Analyse an existing PCAP file instead of live capture.",
+    )
+    mode.add_argument(
+        "--list-interfaces",
+        action="store_true",
+        help="List available network interfaces and exit.",
+    )
+    mode.add_argument(
+        "--show-config",
+        action="store_true",
+        help="Display the loaded configuration and exit.",
     )
 
+    # Capture options
     parser.add_argument(
-        "--duration", "-d", type=float, default=None,
-        help="Live capture duration in seconds. Ignored with --offline.",
+        "--duration", "-d",
+        metavar="SECONDS",
+        type=_positive_float,
+        default=None,
+        help="Live capture duration in seconds (default: unlimited).",
     )
     parser.add_argument(
-        "--report", action="store_true",
-        help="Generate JSON, CSV and HTML reports in the configured reports directory.",
+        "--report", "-r",
+        action="store_true",
+        help="Generate JSON, CSV, and HTML reports after analysis.",
     )
     parser.add_argument(
-        "--list-interfaces", action="store_true",
-        help="List capture interfaces visible to this process and exit.",
+        "--config", "-c",
+        metavar="FILE",
+        default=str(CONFIG_PATH),
+        help=f"Path to the configuration file (default: {CONFIG_PATH}).",
     )
     parser.add_argument(
-        "--show-config", action="store_true",
-        help="Print the loaded configuration and exit.",
+        "--bpf",
+        metavar="FILTER",
+        default="",
+        help='Optional BPF capture filter expression (e.g. "tcp port 80").',
     )
     parser.add_argument(
-        "--config", metavar="PATH", default=None,
-        help="Path to config.json (default: ./config.json).",
+        "--log-level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Override the log level from the configuration file.",
     )
-    parser.add_argument(
-        "--log-level", metavar="LEVEL", default=None,
-        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
-        help="Override the configured log level.",
-    )
-    parser.add_argument(
-        "--baseline-learn", action="store_true",
-        help="Run in baseline-learning mode and overwrite the baseline file on exit.",
-    )
-    parser.add_argument(
-        "--baseline-reset", action="store_true",
-        help="Delete the stored baseline before running.",
-    )
-    parser.add_argument(
-        "--verbose-packets", action="store_true",
-        help="Print a one-line summary for each parsed packet (noisy; for lab use only).",
-    )
+
     return parser
 
 
-# --------------------------------------------------------------------------
-# Sub-command implementations
-# --------------------------------------------------------------------------
+def _positive_float(value: str) -> float:
+    """argparse type: a positive float value."""
+    try:
+        fval = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number.")
+    if fval <= 0:
+        raise argparse.ArgumentTypeError(f"Duration must be > 0, got {fval}.")
+    return fval
 
-def _cmd_list_interfaces() -> int:
-    if not SCAPY_AVAILABLE:
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _configure_file_logging(config) -> None:
+    """Add a rotating file handler based on the loaded config."""
+    from config_loader import LoggingConfig
+    lc: LoggingConfig = config.logging
+    if not lc.log_to_file:
+        return
+    log_path = PROJECT_ROOT / lc.log_filename
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(str(log_path), encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+    )
+    logging.getLogger().addHandler(handler)
+
+
+def _print_separator(char: str = "-", width: int = 60) -> None:
+    print(char * width)
+
+
+def _print_summary(processor, alert_manager) -> None:
+    """Print a concise post-capture summary to stdout."""
+    stats = processor.stats
+    _print_separator()
+    print("  NetSentinel — Capture Summary")
+    _print_separator()
+    print(f"  Total packets processed : {stats.total_packets}")
+    print(f"  Parse errors            : {stats.parse_errors}")
+    print(f"  Elapsed time            : {stats.elapsed_seconds:.1f} s")
+    print()
+    print("  Protocol breakdown:")
+    for proto, count in sorted(stats.protocol_counts.items()):
+        print(f"    {proto:<12} {count}")
+    print()
+    print(f"  Total alerts            : {alert_manager.total_alerts}")
+    print(f"  Suppressed (dedup)      : {alert_manager.suppressed_alerts}")
+    by_sev = alert_manager.alert_count_by_severity()
+    if by_sev:
+        print("  Alerts by severity:")
+        for sev, count in sorted(by_sev.items()):
+            print(f"    {sev:<12} {count}")
+    by_rule = alert_manager.alert_count_by_rule()
+    if by_rule:
+        print("  Alerts by rule:")
+        for rule, count in sorted(by_rule.items()):
+            print(f"    {rule:<12} {count}")
+    _print_separator()
+
+
+# ---------------------------------------------------------------------------
+# Sub-commands
+# ---------------------------------------------------------------------------
+
+def cmd_list_interfaces() -> int:
+    from capture import list_interfaces
+    interfaces = list_interfaces()
+    if not interfaces:
+        print("No interfaces found (Scapy may need elevated privileges).")
+        return EXIT_IO_ERROR
+    print("Available network interfaces:")
+    for iface in interfaces:
+        print(f"  {iface}")
+    return EXIT_OK
+
+
+def cmd_show_config(config_path: Path) -> int:
+    from config_loader import load_config_or_defaults, ConfigError
+    import json, dataclasses
+    try:
+        config = load_config_or_defaults(config_path)
+    except Exception as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    def _to_dict(obj):
+        if dataclasses.is_dataclass(obj):
+            return {k: _to_dict(v) for k, v in dataclasses.asdict(obj).items()}
+        return obj
+
+    print(json.dumps(_to_dict(config), indent=2))
+    return EXIT_OK
+
+
+def cmd_live_capture(
+    args: argparse.Namespace,
+    config,
+) -> int:
+    from capture import LiveCapture, PacketProcessor, validate_interface
+    from alert_manager import AlertManager
+    from baseline import Baseline
+    from parsers import parse_packet
+    from reporter import generate_reports, append_alert_to_jsonl
+
+    interface = args.interface
+
+    # Validate interface.
+    if not validate_interface(interface):
         print(
-            "Scapy is not installed, so interfaces cannot be enumerated.\n"
-            "Install dependencies with: pip install -r requirements.txt",
+            f"Error: Interface {interface!r} not found.\n"
+            "Run --list-interfaces to see available interfaces.",
             file=sys.stderr,
         )
-        return EXIT_RUNTIME_ERROR
+        return EXIT_ARG_ERROR
 
-    interfaces = CaptureEngine.list_interfaces()
-    if not interfaces:
-        print("No capture interfaces were reported by Scapy.", file=sys.stderr)
-        return EXIT_RUNTIME_ERROR
+    alerts_dir = PROJECT_ROOT / config.output.alerts_dir
+    reports_dir = PROJECT_ROOT / config.output.reports_dir
+    data_dir = PROJECT_ROOT / config.output.data_dir
 
-    print("Available capture interfaces:")
-    for name in interfaces:
-        print(f"  - {name}")
-    print(
-        "\nLive capture typically requires root on Linux. "
-        "See README.md for details."
+    alert_manager = AlertManager(config)
+    baseline = Baseline(
+        baseline_file=PROJECT_ROOT / config.baseline.baseline_file,
+        learning_duration_seconds=config.baseline.learning_duration_seconds,
+        anomaly_multiplier=config.baseline.anomaly_multiplier,
     )
-    return EXIT_OK
+    baseline.load()
 
-
-def _cmd_show_config(config: Dict[str, Any]) -> int:
-    import json
-    print(json.dumps(config, indent=2, sort_keys=True, default=str))
-    return EXIT_OK
-
-
-# --------------------------------------------------------------------------
-# Session orchestration
-# --------------------------------------------------------------------------
-
-class Session:
-    """Holds per-run state so shutdown can flush cleanly."""
-
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        baseline: BaselineManager,
-        alert_manager: AlertManager,
-        verbose_packets: bool = False,
-    ) -> None:
-        self.config = config
-        self.baseline = baseline
-        self.alert_manager = alert_manager
-        self.verbose_packets = verbose_packets
-        self.packets_seen = 0
-
-    # Called by CaptureEngine for every parsed packet.
-    def handle(self, parsed) -> None:
-        self.packets_seen += 1
-        self.baseline.observe(parsed)
-        new_alerts = self.alert_manager.process(parsed)
-        if self.verbose_packets:
-            print(f"  pkt: {describe_packet(parsed)}")
+    def on_alerts(new_alerts):
         for alert in new_alerts:
-            src = alert.source_ip or "-"
-            dst = alert.destination_ip or "-"
-            print(
-                f"[{alert.severity.upper()}] {alert.rule_id} {alert.rule_name} "
-                f"({src} -> {dst}): {alert.description}"
-            )
+            append_alert_to_jsonl(alert, alerts_dir)
 
-
-def _build_session(
-    config: Dict[str, Any],
-    learn_mode: bool,
-    verbose_packets: bool,
-) -> Session:
-    baseline_path = Path(config["baseline"]["baseline_file"])
-    baseline = BaselineManager(
-        baseline_path=baseline_path,
-        observation_seconds=config["baseline"]["observation_seconds"],
-        learning_mode=learn_mode or config["baseline"]["learning_mode"],
-    )
-
-    alerts_dir = Path(config["output_dirs"]["alerts"])
-    store = AlertStore(
-        jsonl_path=alerts_dir / "alerts.jsonl",
-        log_path=alerts_dir / "alerts.log",
-    )
-    rules = build_rules_from_config(config)
-    manager = AlertManager(
-        rules=rules,
-        store=store,
-        suppression_window_seconds=config["deduplication"]["suppression_window_seconds"],
-        max_in_memory_alerts=config["retention"]["max_in_memory_alerts"],
-        local_networks=config["network_scope"]["local_networks"],
-        network_scope_enabled=config["network_scope"]["enabled"],
-    )
-    return Session(
-        config=config,
+    processor = PacketProcessor(
+        parser_fn=parse_packet,
+        alert_manager=alert_manager,
         baseline=baseline,
-        alert_manager=manager,
-        verbose_packets=verbose_packets,
+        alert_callback=on_alerts,
     )
 
-
-def _summarise(stats: CaptureStats, alert_manager: AlertManager) -> None:
-    print()
-    print("=" * 68)
-    print("NetSentinel session summary")
-    print("=" * 68)
-    print(f"  Mode               : {stats.mode}")
-    print(f"  Source             : {stats.source}")
-    print(f"  Started (UTC)      : {stats.started_utc}")
-    print(f"  Finished (UTC)     : {stats.finished_utc}")
-    print(f"  Duration (s)       : {stats.duration_seconds:.2f}")
-    print(f"  Total packets      : {stats.total_packets}")
-    print(f"  Parsed packets     : {stats.parsed_packets}")
-    print(f"  Parse errors       : {stats.parse_errors}")
-    print(f"  Filtered packets   : {stats.filtered_packets}")
-    print(f"  Alerts (new)       : {alert_manager.total_alerts}")
-    print(f"  Alerts (suppressed): {alert_manager.suppressed_alerts}")
-
-    if stats.protocol_counts:
-        print("  Protocol counts    :")
-        for proto, count in sorted(stats.protocol_counts.items()):
-            print(f"      {proto:<6} {count}")
-
-    if alert_manager.total_alerts:
-        print("  Alerts by rule     :")
-        for rule, count in sorted(alert_manager.counts_by_rule().items()):
-            print(f"      {rule:<8} {count}")
-        print("  Alerts by severity :")
-        for sev, count in sorted(alert_manager.counts_by_severity().items()):
-            print(f"      {sev:<8} {count}")
-    print("=" * 68)
-
-
-# --------------------------------------------------------------------------
-# Run paths
-# --------------------------------------------------------------------------
-
-def _run_offline(
-    args: argparse.Namespace,
-    config: Dict[str, Any],
-    session: Session,
-) -> int:
-    engine = CaptureEngine(
-        packet_handler=session.handle,
-        local_networks=config["network_scope"]["local_networks"],
-        network_scope_enabled=config["network_scope"]["enabled"],
-    )
-    try:
-        stats = engine.run_offline(args.offline)
-    except CaptureError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_RUNTIME_ERROR
-    return _finalise(args, config, session, stats, mode="offline")
-
-
-def _run_live(
-    args: argparse.Namespace,
-    config: Dict[str, Any],
-    session: Session,
-) -> int:
-    engine = CaptureEngine(
-        packet_handler=session.handle,
-        local_networks=config["network_scope"]["local_networks"],
-        network_scope_enabled=config["network_scope"]["enabled"],
+    capture = LiveCapture(
+        interface=interface,
+        processor=processor,
+        bpf_filter=args.bpf,
     )
 
-    # Translate SIGINT into a graceful engine stop so the summary and any
-    # requested reports are still produced.
-    def _handle_sigint(signum, frame):  # noqa: ARG001 - signature fixed by signal
-        print("\nInterrupt received - stopping capture...", file=sys.stderr)
-        engine.stop()
-        raise KeyboardInterrupt
+    # Graceful Ctrl+C shutdown.
+    def _sigint_handler(signum, frame):
+        print("\n[*] Interrupt received — stopping capture...")
+        capture.stop()
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    print(f"[*] Starting live capture on {interface!r}...")
+    if args.duration:
+        print(f"[*] Duration: {args.duration} seconds.")
+    print("[*] Press Ctrl+C to stop.\n")
 
     try:
-        signal.signal(signal.SIGINT, _handle_sigint)
-    except ValueError:
-        # Not on the main thread; fall back to default handling.
-        pass
-
-    try:
-        stats = engine.run_live(
-            interface=args.interface,
-            duration=args.duration,
+        capture.start(duration=args.duration)
+    except PermissionError:
+        print(
+            "Error: Permission denied.\n"
+            "Run with sudo, or grant CAP_NET_RAW to the Python interpreter:\n"
+            "  sudo setcap cap_net_raw,cap_net_admin+eip $(which python3)",
+            file=sys.stderr,
         )
-    except CaptureError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_RUNTIME_ERROR
-    except KeyboardInterrupt:
-        # The engine has already flushed stats when it caught the signal.
-        stats = engine.stats
+        return EXIT_PERMISSION
+    except OSError as exc:
+        print(f"Capture error: {exc}", file=sys.stderr)
+        return EXIT_IO_ERROR
 
-    return _finalise(args, config, session, stats, mode="live")
-
-
-def _finalise(
-    args: argparse.Namespace,
-    config: Dict[str, Any],
-    session: Session,
-    stats: CaptureStats,
-    mode: str,
-) -> int:
-    # Persist the baseline if we were learning.
-    if session.baseline.learning_mode_active:
-        try:
-            session.baseline.save()
-        except BaselineError as exc:
-            print(f"warning: {exc}", file=sys.stderr)
-
-    _summarise(stats, session.alert_manager)
+    _print_summary(processor, alert_manager)
 
     if args.report:
-        generator = ReportGenerator(
-            output_dir=Path(config["output_dirs"]["reports"]),
-            capture_stats=stats,
-            alerts=session.alert_manager.alerts(),
-            baseline_summary=session.baseline.summary(),
-            config=config,
-            session_label=stats.source,
-        )
         try:
-            paths = generator.write_all()
-        except ReportError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return EXIT_RUNTIME_ERROR
-        print("Reports written:")
-        print(f"  JSON: {paths.json_path}")
-        print(f"  CSV : {paths.csv_path}")
-        print(f"  HTML: {paths.html_path}")
+            paths = generate_reports(
+                alerts=alert_manager.alerts,
+                stats=processor.stats,
+                reports_dir=reports_dir,
+                analysis_mode="live",
+                project_name="NetSentinel",
+            )
+            print("\n[*] Reports generated:")
+            for fmt, p in paths.items():
+                print(f"    {fmt.upper():<6} {p}")
+        except OSError as exc:
+            print(f"Report generation failed: {exc}", file=sys.stderr)
 
     return EXIT_OK
 
 
-# --------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------
+def cmd_offline(
+    args: argparse.Namespace,
+    config,
+) -> int:
+    from capture import OfflineCapture, PacketProcessor
+    from alert_manager import AlertManager
+    from baseline import Baseline
+    from parsers import parse_packet
+    from reporter import generate_reports, append_alert_to_jsonl
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    pcap_path = Path(args.offline).expanduser().resolve()
+    if not pcap_path.exists():
+        print(f"Error: PCAP file not found: {pcap_path}", file=sys.stderr)
+        return EXIT_ARG_ERROR
+    if not pcap_path.is_file():
+        print(f"Error: {pcap_path} is not a file.", file=sys.stderr)
+        return EXIT_ARG_ERROR
 
-    # Handle trivial commands before loading configuration so that
-    # --list-interfaces and --help work even with a broken config file.
-    if args.list_interfaces:
-        return _cmd_list_interfaces()
+    alerts_dir = PROJECT_ROOT / config.output.alerts_dir
+    reports_dir = PROJECT_ROOT / config.output.reports_dir
 
-    # Load and validate configuration.
+    alert_manager = AlertManager(config)
+    baseline = Baseline(
+        baseline_file=PROJECT_ROOT / config.baseline.baseline_file,
+        learning_duration_seconds=config.baseline.learning_duration_seconds,
+        anomaly_multiplier=config.baseline.anomaly_multiplier,
+    )
+    baseline.load()
+
+    def on_alerts(new_alerts):
+        for alert in new_alerts:
+            append_alert_to_jsonl(alert, alerts_dir)
+
+    processor = PacketProcessor(
+        parser_fn=parse_packet,
+        alert_manager=alert_manager,
+        baseline=baseline,
+        alert_callback=on_alerts,
+    )
+
+    print(f"[*] Analysing offline PCAP: {pcap_path}\n")
+
     try:
-        config = load_config(args.config)
-    except ConfigError as exc:
-        print(f"configuration error: {exc}", file=sys.stderr)
-        return EXIT_USAGE_ERROR
+        cap = OfflineCapture(pcap_path=pcap_path, processor=processor)
+        cap.run()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_ARG_ERROR
+    except RuntimeError as exc:
+        print(f"Capture error: {exc}", file=sys.stderr)
+        return EXIT_IO_ERROR
 
-    # Apply CLI overrides.
-    if args.log_level:
-        config["log_level"] = args.log_level.upper()
+    _print_summary(processor, alert_manager)
 
-    log_dir = Path(config["output_dirs"]["logs"])
-    _configure_logging(config["log_level"], log_dir)
-    LOGGER.debug("Effective configuration: %s", config)
+    if args.report:
+        try:
+            paths = generate_reports(
+                alerts=alert_manager.alerts,
+                stats=processor.stats,
+                reports_dir=reports_dir,
+                analysis_mode="offline",
+                pcap_file=str(pcap_path),
+                project_name="NetSentinel",
+            )
+            print("\n[*] Reports generated:")
+            for fmt, p in paths.items():
+                print(f"    {fmt.upper():<6} {p}")
+        except OSError as exc:
+            print(f"Report generation failed: {exc}", file=sys.stderr)
+
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    # Bootstrap console logging early.
+    _bootstrap_logging(args.log_level or "INFO")
+
+    logger = logging.getLogger("main")
+
+    # Load configuration.
+    config_path = Path(args.config).expanduser().resolve()
+
+    # Commands that don't need a full valid config.
+    if args.list_interfaces:
+        return cmd_list_interfaces()
 
     if args.show_config:
-        return _cmd_show_config(config)
+        return cmd_show_config(config_path)
 
-    # Require a mode for anything that actually runs the pipeline.
-    if not args.interface and not args.offline:
-        parser.print_help(sys.stderr)
-        print(
-            "\nerror: one of --interface or --offline is required for monitoring.",
-            file=sys.stderr,
-        )
-        return EXIT_USAGE_ERROR
-
-    # Reject incompatible combinations explicitly.
-    if args.offline and args.duration is not None:
-        print(
-            "error: --duration only applies to live capture; remove it or "
-            "drop --offline.",
-            file=sys.stderr,
-        )
-        return EXIT_USAGE_ERROR
-    if args.offline and args.baseline_learn:
-        # Allowed: learning from a PCAP is a valid workflow. Nothing to reject.
-
-    # Optional baseline reset before the session starts.
-    baseline_path = Path(config["baseline"]["baseline_file"])
-    if args.baseline_reset and baseline_path.exists():
-        try:
-            baseline_path.unlink()
-            print(f"Baseline reset: removed {baseline_path}")
-        except OSError as exc:
-            print(f"error: could not remove baseline {baseline_path}: {exc}",
-                  file=sys.stderr)
-            return EXIT_RUNTIME_ERROR
-
-    # Build the per-run session.
+    # All other commands require a valid config.
+    from config_loader import load_config, ConfigError
     try:
-        session = _build_session(
-            config,
-            learn_mode=args.baseline_learn or config["baseline"]["learning_mode"],
-            verbose_packets=args.verbose_packets,
-        )
-    except (ValueError, KeyError) as exc:
-        print(f"error: could not build session: {exc}", file=sys.stderr)
-        return EXIT_RUNTIME_ERROR
+        config = load_config(config_path)
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
 
-    print(f"NetSentinel starting at {utc_now_iso()}")
-    if session.baseline.learning_mode_active:
-        print("Running in baseline LEARNING mode - detections are still active.")
-    elif session.baseline.has_baseline:
-        print(f"Loaded baseline from {baseline_path}")
-    else:
-        print("No baseline loaded; first-run mode.")
+    # Override log level from CLI if provided.
+    if args.log_level:
+        config.logging.level = args.log_level
+    _bootstrap_logging(config.logging.level)
+    _configure_file_logging(config)
+
+    # Validate: --duration only makes sense with --interface.
+    if args.duration and not args.interface:
+        print(
+            "Error: --duration is only valid with --interface (live capture).",
+            file=sys.stderr,
+        )
+        return EXIT_ARG_ERROR
+
+    # Validate: --bpf only makes sense with --interface.
+    if args.bpf and not args.interface:
+        print(
+            "Error: --bpf filter is only valid with --interface (live capture).",
+            file=sys.stderr,
+        )
+        return EXIT_ARG_ERROR
+
+    if args.interface:
+        return cmd_live_capture(args, config)
 
     if args.offline:
-        return _run_offline(args, config, session)
-    return _run_live(args, config, session)
+        return cmd_offline(args, config)
+
+    # No mode selected.
+    parser.print_help()
+    print(
+        "\nError: Specify --interface <IFACE>, --offline <FILE>, "
+        "--list-interfaces, or --show-config.",
+        file=sys.stderr,
+    )
+    return EXIT_ARG_ERROR
 
 
 if __name__ == "__main__":

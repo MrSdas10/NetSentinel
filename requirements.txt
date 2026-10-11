@@ -1,15 +1,29 @@
-# NetSentinel runtime dependencies.
+# NetSentinel — Python dependencies
 #
-# Scapy is the only external dependency.  It is used for packet capture and
-# protocol dissection only.  The version range is deliberately broad because
-# Scapy's public API for the layers we use (Ether, IP, TCP, UDP, ICMP, ARP,
-# DNS) has been stable across the 2.5.x and 2.6.x series.  If installation
-# fails on your platform, pin to a version known to work there and document
-# the change in your local fork.
+# Core dependency
+# ---------------
+# scapy handles packet capture, PCAP reading, and protocol dissection.
+# Version 2.5.x is a stable branch compatible with Python 3.11+.
+# On Linux, live capture requires root or CAP_NET_RAW.
+# On Windows, Npcap (https://npcap.com) must be installed separately.
+# On macOS, sudo is typically required for live capture.
 #
-# Install with:
-#     python -m pip install -r requirements.txt
+# To verify your installed version:
+#   python -c "import scapy; print(scapy.__version__)"
 #
-# Verify the installed version with:
-#     python -c "import scapy; print(scapy.__version__)"
-scapy>=2.5.0,<2.7
+scapy>=2.5.0,<2.6.0
+
+# All other dependencies (collections, logging, json, csv, argparse,
+# unittest, pathlib, ipaddress, datetime, threading, uuid) are part of
+# the Python standard library and do not need to be listed here.
+#
+# Operating-system packages required for live capture
+# ----------------------------------------------------
+# Linux (Debian/Ubuntu/Kali):
+#   sudo apt-get install python3-dev libpcap-dev
+#
+# macOS (Homebrew):
+#   brew install libpcap
+#
+# Windows:
+#   Install Npcap from https://npcap.com (WinPcap compatibility mode)

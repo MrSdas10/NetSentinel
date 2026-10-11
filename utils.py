@@ -1,223 +1,219 @@
-"""Shared, dependency-free helpers for NetSentinel.
+"""
+utils.py — Shared utility functions for NetSentinel.
 
-Only small generic utilities belong here: UTC time handling, address
-normalisation, identifier generation and thread-safe file helpers.
-Detection logic lives in :mod:`alert_manager`; parsing lives in
-:mod:`parsers`.
+Provides: UTC timestamps, IP/MAC normalization, UUID generation,
+safe JSON serialization, directory creation, and input validation.
+
+No detection logic lives here.
 """
 
-from __future__ import annotations
-
-import ipaddress
 import json
+import logging
 import re
-import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Optional
 
-# MAC addresses are normalised to lowercase, colon-separated form.
-_MAC_COLON_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
-_MAC_BARE_RE = re.compile(r"^[0-9a-f]{12}$")
+logger = logging.getLogger(__name__)
 
-
-class NetSentinelError(Exception):
-    """Base class for all NetSentinel-specific errors."""
-
-
-# --------------------------------------------------------------------------
-# Time helpers.  All exported timestamps are ISO-8601 in UTC with a 'Z' suffix.
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Timestamps
+# ---------------------------------------------------------------------------
 
 def utc_now() -> datetime:
-    """Return the current timezone-aware UTC datetime."""
+    """Return the current UTC datetime (timezone-aware)."""
     return datetime.now(timezone.utc)
 
 
-def to_utc_iso(value: Any) -> str:
-    """Normalise ``value`` to an ISO-8601 UTC string ending in ``Z``.
-
-    Accepts a :class:`datetime`, an epoch number (int/float) or an ISO-8601
-    string.  Naive datetimes are assumed to already be UTC.
-    """
-    if isinstance(value, datetime):
-        dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc)
-    elif isinstance(value, bool):
-        raise TypeError("Booleans are not valid timestamps")
-    elif isinstance(value, (int, float)):
-        dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
-    elif isinstance(value, str):
-        text = value.strip()
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc)
-    else:
-        raise TypeError(f"Unsupported timestamp type: {type(value)!r}")
-
-    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
 def utc_now_iso() -> str:
-    """Return the current UTC time as an ISO-8601 string."""
-    return to_utc_iso(utc_now())
+    """Return the current UTC time as an ISO-8601 string ending in 'Z'."""
+    return utc_now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def epoch_now() -> float:
-    """Return the current UTC time as epoch seconds."""
-    return utc_now().timestamp()
-
-
-# --------------------------------------------------------------------------
-# Address helpers
-# --------------------------------------------------------------------------
-
-def normalize_ip(value: Any) -> Optional[str]:
-    """Return a canonical textual IP address, or ``None`` if invalid.
-
-    Uses :mod:`ipaddress` so that IPv6 addresses are compressed consistently
-    and leading zeros are rejected rather than silently reinterpreted.
+def timestamp_to_iso(dt: datetime) -> str:
     """
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    # Scapy renders some addresses with a trailing scope id such as '%eth0'.
-    if "%" in text:
-        text = text.split("%", 1)[0]
-    try:
-        return str(ipaddress.ip_address(text))
-    except ValueError:
-        return None
+    Convert a datetime object to an ISO-8601 UTC string.
+
+    If *dt* is naive (no tzinfo), it is assumed to be UTC.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def normalize_mac(value: Any) -> Optional[str]:
-    """Return a canonical lowercase colon-separated MAC address or ``None``."""
-    if value is None:
+def epoch_to_iso(epoch: float) -> str:
+    """Convert a POSIX timestamp (float seconds) to an ISO-8601 UTC string."""
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+# ---------------------------------------------------------------------------
+# Identifiers
+# ---------------------------------------------------------------------------
+
+def new_alert_id() -> str:
+    """Return a new unique alert identifier (UUID4 hex string)."""
+    return uuid.uuid4().hex
+
+
+# ---------------------------------------------------------------------------
+# IP / MAC normalization
+# ---------------------------------------------------------------------------
+
+# Matches a 6-group colon-separated MAC address (case-insensitive)
+_MAC_RE = re.compile(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
+
+
+def normalize_ip(address: Optional[str]) -> Optional[str]:
+    """
+    Return the IP address string in a canonical lower-case form,
+    or None if *address* is empty, None, or clearly invalid.
+
+    Does not validate whether the address is routable or assigned.
+    """
+    if not address:
         return None
-    text = str(value).strip().lower().replace("-", ":")
-    if _MAC_COLON_RE.match(text):
-        return text
-    if _MAC_BARE_RE.match(text):
-        return ":".join(text[i:i + 2] for i in range(0, 12, 2))
+    address = address.strip()
+    if not address:
+        return None
+    return address  # Scapy already returns dotted-decimal strings.
+
+
+def normalize_mac(address: Optional[str]) -> Optional[str]:
+    """
+    Return the MAC address in lower-case colon-separated form,
+    or None if *address* is None, empty, or does not match the expected format.
+    """
+    if not address:
+        return None
+    address = address.strip().lower()
+    # Scapy uses colon-separated form; accept it directly.
+    if _MAC_RE.match(address):
+        return address
+    # Try converting dash-separated (Windows) to colon form.
+    if "-" in address:
+        parts = address.split("-")
+        if len(parts) == 6:
+            converted = ":".join(parts)
+            if _MAC_RE.match(converted):
+                return converted
     return None
 
 
-def ip_in_networks(ip: Optional[str], networks: Iterable[str]) -> bool:
-    """Return ``True`` if ``ip`` falls inside any of ``networks``.
+# ---------------------------------------------------------------------------
+# Safe JSON serialization
+# ---------------------------------------------------------------------------
 
-    Invalid entries in ``networks`` are ignored; configuration validation is
-    responsible for rejecting them earlier.
+class _SafeEncoder(json.JSONEncoder):
     """
-    if ip is None:
-        return False
-    try:
-        address = ipaddress.ip_address(ip)
-    except ValueError:
-        return False
+    JSON encoder that handles datetime objects and falls back to str()
+    for types that the standard encoder cannot handle.
+    """
 
-    for entry in networks:
+    def default(self, obj: Any) -> Any:
+        if isinstance(obj, datetime):
+            return timestamp_to_iso(obj)
         try:
-            network = ipaddress.ip_network(str(entry), strict=False)
-        except ValueError:
-            continue
-        # Comparing versions avoids the TypeError raised by mixed families.
-        if address.version == network.version and address in network:
-            return True
-    return False
+            return super().default(obj)
+        except TypeError:
+            return str(obj)
 
 
-# --------------------------------------------------------------------------
-# Identifier and serialisation helpers
-# --------------------------------------------------------------------------
-
-def generate_id(prefix: str = "alert") -> str:
-    """Return a short, unique, human-readable identifier."""
-    return f"{prefix}-{uuid.uuid4().hex[:12]}"
-
-
-def _json_default(obj: Any) -> Any:
-    """Fallback serialiser for objects :mod:`json` cannot handle natively."""
-    if isinstance(obj, (set, frozenset)):
-        return sorted(obj, key=str)
-    if isinstance(obj, Path):
-        return str(obj)
-    if isinstance(obj, datetime):
-        return to_utc_iso(obj)
-    if isinstance(obj, bytes):
-        return obj.decode("utf-8", errors="replace")
-    return repr(obj)
-
-
-def dumps_json(obj: Any, **kwargs: Any) -> str:
-    """Serialise ``obj`` to JSON with NetSentinel's fallback handling."""
-    kwargs.setdefault("default", _json_default)
-    kwargs.setdefault("ensure_ascii", False)
-    return json.dumps(obj, **kwargs)
-
-
-# --------------------------------------------------------------------------
-# File helpers
-# --------------------------------------------------------------------------
-
-def ensure_dir(path: Any) -> Path:
-    """Create ``path`` (and parents) if needed and return it as a Path."""
-    directory = Path(path)
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
-
-
-def atomic_write_text(path: Any, text: str, encoding: str = "utf-8") -> Path:
-    """Write ``text`` to ``path`` via a temporary file and an atomic rename.
-
-    Prevents a partially written report or baseline from being left behind if
-    the process is interrupted mid-write.
+def safe_json_dumps(obj: Any, indent: Optional[int] = None) -> str:
     """
-    target = Path(path)
-    ensure_dir(target.parent)
-    temp = target.with_name(target.name + ".tmp")
-    temp.write_text(text, encoding=encoding)
-    temp.replace(target)
-    return target
+    Serialize *obj* to a JSON string, handling datetimes and unknown types.
+    Raises ValueError if the result cannot be serialized after fallback.
+    """
+    return json.dumps(obj, cls=_SafeEncoder, indent=indent, ensure_ascii=False)
 
 
-def truncate_text(value: str, limit: int = 200) -> str:
-    """Return ``value`` shortened to ``limit`` characters with an ellipsis."""
-    if limit <= 0:
+def safe_json_loads(text: str) -> Any:
+    """
+    Deserialize a JSON string, returning None on parse errors rather than
+    propagating an exception — callers must check for None.
+    """
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.debug("JSON parse error: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Directory helpers
+# ---------------------------------------------------------------------------
+
+def ensure_directory(path: Path) -> Path:
+    """
+    Create *path* and all intermediate directories if they do not exist.
+    Return *path* on success.  Raise OSError on failure.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.error("Cannot create directory %s: %s", path, exc)
+        raise
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Input validation helpers
+# ---------------------------------------------------------------------------
+
+def is_positive_int(value: Any) -> bool:
+    """Return True if *value* is an integer greater than zero."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def is_non_negative_number(value: Any) -> bool:
+    """Return True if *value* is a non-negative int or float."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+
+
+def is_non_empty_string(value: Any) -> bool:
+    """Return True if *value* is a non-empty string."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    """Return *value* clamped to the inclusive range [lo, hi]."""
+    return max(lo, min(hi, value))
+
+
+# ---------------------------------------------------------------------------
+# HTML escaping (used by reporter.py)
+# ---------------------------------------------------------------------------
+
+def html_escape(text: str) -> str:
+    """
+    Escape characters that have special meaning in HTML.
+
+    This is a minimal implementation that does not depend on html.escape
+    but behaves identically.  We avoid importing the html module solely
+    to keep this function self-contained and clearly auditable.
+    """
+    replacements = [
+        ("&", "&amp;"),   # Must be first to avoid double-escaping.
+        ("<", "&lt;"),
+        (">", "&gt;"),
+        ('"', "&quot;"),
+        ("'", "&#x27;"),
+    ]
+    for char, entity in replacements:
+        text = text.replace(char, entity)
+    return text
+
+
+def safe_html(value: Any) -> str:
+    """
+    Convert *value* to a safe HTML string.
+
+    None is treated as "no value" and returns an empty string.
+    All other values are converted with str() and then HTML-escaped.
+    """
+    if value is None:
         return ""
-    if len(value) <= limit:
-        return value
-    return value[: max(0, limit - 3)] + "..."
-
-
-class FileAppender:
-    """Thread-safe, append-only line writer.
-
-    A single lock guards all writes so concurrent producers (for example a
-    capture thread and a shutdown-time flush) cannot interleave partial lines.
-    Errors propagate to the caller; they are never swallowed.
-    """
-
-    def __init__(self, path: Any) -> None:
-        self.path = Path(path)
-        self._lock = threading.Lock()
-
-    def append(self, line: str) -> None:
-        """Append one line, adding a trailing newline when missing."""
-        with self._lock:
-            ensure_dir(self.path.parent)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(line)
-                if not line.endswith("\n"):
-                    handle.write("\n")
-
-    def read_lines(self) -> List[str]:
-        """Return previously written lines, or an empty list if absent."""
-        if not self.path.exists():
-            return []
-        return self.path.read_text(encoding="utf-8").splitlines()
+    return html_escape(str(value))

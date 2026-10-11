@@ -1,86 +1,121 @@
-"""Tests for the ICMP-001 echo-request rate rule."""
+"""
+test_icmp_detection.py — Tests for ICMP-001 (echo request rate detection).
+"""
 
-from __future__ import annotations
-
+import sys
 import unittest
+from pathlib import Path
 
-from alert_manager import IcmpEchoRateRule
-from parsers import ParsedPacket
-from utils import to_utc_iso
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-EPOCH = 1_700_000_000.0
+from scapy.layers.l2 import Ether
+from scapy.layers.inet import IP, ICMP
+
+from config_loader import Config, IcmpConfig
+from alert_manager import IcmpRateRule
+from parsers import parse_packet, ICMP_ECHO_REQUEST, ICMP_ECHO_REPLY
 
 
-def _icmp(src_ip: str, dst_ip: str, icmp_type: int, epoch: float) -> ParsedPacket:
-    return ParsedPacket(
-        timestamp_utc=to_utc_iso(epoch),
-        timestamp_epoch=epoch,
-        src_ip=src_ip,
-        dst_ip=dst_ip,
-        ip_proto=1,
-        icmp_type=icmp_type,
-        icmp_code=0,
-        protocol="ICMP",
+def _make_request(src="10.0.0.1", dst="10.0.0.2"):
+    return parse_packet(
+        Ether() / IP(src=src, dst=dst) / ICMP(type=ICMP_ECHO_REQUEST, code=0)
     )
 
 
-class IcmpEchoRateRuleTests(unittest.TestCase):
-
-    def test_below_threshold_does_not_fire(self):
-        rule = IcmpEchoRateRule(window_seconds=5, threshold=10)
-        for i in range(5):
-            result = rule.process(
-                _icmp("10.0.0.1", "10.0.0.2", 8, EPOCH + i * 0.2),
-                EPOCH + i * 0.2,
-            )
-            self.assertIsNone(result)
-
-    def test_above_threshold_fires(self):
-        rule = IcmpEchoRateRule(window_seconds=5, threshold=5)
-        alert = None
-        for i in range(6):
-            alert = rule.process(
-                _icmp("10.0.0.1", "10.0.0.2", 8, EPOCH + i * 0.2),
-                EPOCH + i * 0.2,
-            )
-        self.assertIsNotNone(alert)
-        assert alert is not None
-        self.assertEqual(alert.rule_id, "ICMP-001")
-        self.assertGreaterEqual(alert.evidence["echo_requests"], 5)
-        self.assertIn("note", alert.evidence)
-
-    def test_echo_replies_are_not_counted(self):
-        rule = IcmpEchoRateRule(window_seconds=5, threshold=3)
-        for i in range(20):
-            result = rule.process(
-                _icmp("10.0.0.2", "10.0.0.1", 0, EPOCH + i * 0.1),
-                EPOCH + i * 0.1,
-            )
-            self.assertIsNone(result)
-
-    def test_other_icmp_types_are_ignored(self):
-        rule = IcmpEchoRateRule(window_seconds=5, threshold=3)
-        # Type 3 = Destination Unreachable
-        for i in range(10):
-            result = rule.process(
-                _icmp("10.0.0.1", "10.0.0.2", 3, EPOCH + i * 0.1),
-                EPOCH + i * 0.1,
-            )
-            self.assertIsNone(result)
-
-    def test_window_expiry(self):
-        rule = IcmpEchoRateRule(window_seconds=1.0, threshold=3)
-        for i in range(2):
-            rule.process(
-                _icmp("10.0.0.1", "10.0.0.2", 8, EPOCH + i * 0.1),
-                EPOCH + i * 0.1,
-            )
-        # Next request is outside the 1s window; only one should remain.
-        result = rule.process(
-            _icmp("10.0.0.1", "10.0.0.2", 8, EPOCH + 5.0), EPOCH + 5.0
-        )
-        self.assertIsNone(result)
+def _make_reply(src="10.0.0.2", dst="10.0.0.1"):
+    return parse_packet(
+        Ether() / IP(src=src, dst=dst) / ICMP(type=ICMP_ECHO_REPLY, code=0)
+    )
 
 
-if __name__ == "__main__":  # pragma: no cover
+def _make_config(threshold=10, window=30, excluded=None):
+    config = Config()
+    config.icmp = IcmpConfig(
+        enabled=True,
+        echo_request_threshold=threshold,
+        observation_window_seconds=window,
+        excluded_sources=excluded or [],
+    )
+    return config
+
+
+class TestIcmpAboveThreshold(unittest.TestCase):
+    def test_triggers_at_threshold(self):
+        config = _make_config(threshold=5, window=30)
+        rule = IcmpRateRule(config, time_fn=lambda: 0.0)
+        evidence = None
+        for _ in range(5):
+            evidence = rule.process(_make_request())
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["rule_id"], "ICMP-001")
+        self.assertGreaterEqual(evidence["echo_request_count"], 5)
+
+    def test_evidence_contains_required_fields(self):
+        config = _make_config(threshold=3)
+        rule = IcmpRateRule(config, time_fn=lambda: 0.0)
+        evidence = None
+        for _ in range(3):
+            evidence = rule.process(_make_request())
+        self.assertIsNotNone(evidence)
+        for field in ("echo_request_count", "threshold",
+                      "observation_window_seconds", "source_ip"):
+            self.assertIn(field, evidence)
+
+
+class TestIcmpBelowThreshold(unittest.TestCase):
+    def test_no_alert_below_threshold(self):
+        config = _make_config(threshold=10)
+        rule = IcmpRateRule(config, time_fn=lambda: 0.0)
+        for _ in range(9):
+            evidence = rule.process(_make_request())
+            self.assertIsNone(evidence)
+
+
+class TestIcmpRepliesNotCounted(unittest.TestCase):
+    """Echo replies must not count toward the threshold."""
+
+    def test_replies_dont_trigger(self):
+        config = _make_config(threshold=5)
+        rule = IcmpRateRule(config, time_fn=lambda: 0.0)
+        for _ in range(100):
+            evidence = rule.process(_make_reply())
+            self.assertIsNone(evidence)
+
+
+class TestIcmpExcludedSource(unittest.TestCase):
+    def test_excluded_never_alerts(self):
+        config = _make_config(threshold=2, excluded=["10.0.0.1"])
+        rule = IcmpRateRule(config, time_fn=lambda: 0.0)
+        for _ in range(100):
+            self.assertIsNone(rule.process(_make_request(src="10.0.0.1")))
+
+
+class TestIcmpSlidingWindow(unittest.TestCase):
+    def test_old_requests_expire(self):
+        current_time = [0.0]
+
+        def clock():
+            return current_time[0]
+
+        config = _make_config(threshold=5, window=30)
+        rule = IcmpRateRule(config, time_fn=clock)
+
+        for _ in range(4):
+            rule.process(_make_request())
+
+        current_time[0] = 35.0  # Window expired.
+        evidence = rule.process(_make_request())
+        self.assertIsNone(evidence)  # Count reset to 1 after expiry.
+
+
+class TestIcmpDisabledRule(unittest.TestCase):
+    def test_disabled_never_triggers(self):
+        config = _make_config(threshold=1)
+        config.icmp.enabled = False
+        rule = IcmpRateRule(config, time_fn=lambda: 0.0)
+        for _ in range(100):
+            self.assertIsNone(rule.process(_make_request()))
+
+
+if __name__ == "__main__":
     unittest.main()

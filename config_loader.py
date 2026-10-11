@@ -1,370 +1,410 @@
-"""Configuration loading and validation for NetSentinel.
+"""
+config_loader.py — Configuration loading and validation for NetSentinel.
 
-``config.json`` is the single source of truth for every tunable value.  This
-module guarantees that, once :func:`load_config` returns, every key the rest of
-the application indexes is present and of the expected type.  A missing or
-invalid value is always an error - a detection rule is never silently disabled
-because a key was absent.
+Reads config.json, validates every field, and returns a typed Config
+dataclass.  Raises ConfigError with an actionable message for any invalid
+setting so that main.py can report the problem and exit cleanly.
+
+Key names and default values must match the generated config.json exactly.
 """
 
-from __future__ import annotations
-
-import ipaddress
 import json
+import logging
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Optional
 
-from utils import NetSentinelError
-
-DEFAULT_CONFIG_FILENAME = "config.json"
-
-SEVERITY_LEVELS = ("low", "medium", "high", "critical")
-KNOWN_RULES = ("TCP-001", "UDP-001", "ICMP-001", "ARP-001", "DNS-001", "DNS-002")
-LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
-OUTPUT_DIR_KEYS = ("alerts", "reports", "logs", "data")
+logger = logging.getLogger(__name__)
 
 
-class ConfigError(NetSentinelError):
-    """Raised when configuration is missing, unreadable or invalid."""
+class ConfigError(ValueError):
+    """Raised when the configuration file is missing, unreadable, or invalid."""
 
 
-# --------------------------------------------------------------------------
-# Primitive validators
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Sub-configuration dataclasses (one per logical group)
+# ---------------------------------------------------------------------------
 
-def _expect_mapping(value: Any, dotted: str) -> Dict[str, Any]:
-    if not isinstance(value, dict):
+@dataclass
+class TcpConfig:
+    enabled: bool = True
+    syn_port_threshold: int = 20        # Distinct destination ports in window
+    observation_window_seconds: int = 60
+    excluded_sources: List[str] = field(default_factory=list)
+
+
+@dataclass
+class UdpConfig:
+    enabled: bool = True
+    port_diversity_threshold: int = 15  # Distinct destination ports in window
+    observation_window_seconds: int = 60
+    excluded_sources: List[str] = field(default_factory=list)
+
+
+@dataclass
+class IcmpConfig:
+    enabled: bool = True
+    echo_request_threshold: int = 50    # Echo requests per window
+    observation_window_seconds: int = 30
+    excluded_sources: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ArpConfig:
+    enabled: bool = True
+    # How long (seconds) before a seen mapping is considered stale.
+    mapping_expiry_seconds: int = 300
+    # Static trusted IP→MAC mappings that should never trigger an alert.
+    trusted_mappings: Dict[str, str] = field(default_factory=dict)
+    # Maximum number of IP→MAC mappings to retain in memory.
+    max_table_size: int = 1024
+
+
+@dataclass
+class DnsConfig:
+    enabled: bool = True
+    query_rate_threshold: int = 100     # Queries per source per window
+    observation_window_seconds: int = 60
+    nxdomain_threshold: int = 20        # NXDOMAINs per source per window
+    nxdomain_window_seconds: int = 60
+    excluded_sources: List[str] = field(default_factory=list)
+
+
+@dataclass
+class BaselineConfig:
+    enabled: bool = True
+    learning_duration_seconds: int = 300   # Time to collect baseline data
+    baseline_file: str = "data/baseline.json"
+    # Multiplier applied to baseline average to set the anomaly threshold.
+    # e.g. 2.0 means "alert if current value > 2x baseline average".
+    anomaly_multiplier: float = 2.0
+
+
+@dataclass
+class OutputConfig:
+    alerts_dir: str = "alerts"
+    reports_dir: str = "reports"
+    logs_dir: str = "logs"
+    data_dir: str = "data"
+    # Maximum alerts held in memory.
+    max_alerts_in_memory: int = 10000
+    # Seconds during which an identical alert (same rule+source) is suppressed.
+    alert_suppression_window_seconds: int = 60
+    generate_report_on_exit: bool = True
+
+
+@dataclass
+class LoggingConfig:
+    level: str = "INFO"          # DEBUG | INFO | WARNING | ERROR
+    log_to_file: bool = True
+    log_filename: str = "logs/netsentinel.log"
+
+
+@dataclass
+class Config:
+    tcp: TcpConfig = field(default_factory=TcpConfig)
+    udp: UdpConfig = field(default_factory=UdpConfig)
+    icmp: IcmpConfig = field(default_factory=IcmpConfig)
+    arp: ArpConfig = field(default_factory=ArpConfig)
+    dns: DnsConfig = field(default_factory=DnsConfig)
+    baseline: BaselineConfig = field(default_factory=BaselineConfig)
+    output: OutputConfig = field(default_factory=OutputConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    # Optional: restrict analysis to packets from/to these CIDR networks.
+    # Empty list means "monitor all observed traffic".
+    local_networks: List[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+def _require_bool(d: Dict, key: str, section: str) -> bool:
+    val = d.get(key)
+    if not isinstance(val, bool):
         raise ConfigError(
-            f"'{dotted}' must be a JSON object, got {type(value).__name__}"
+            f"[{section}] '{key}' must be true or false, got {val!r}"
         )
-    return value
+    return val
 
 
-def _expect_bool(value: Any, dotted: str) -> bool:
-    if not isinstance(value, bool):
-        raise ConfigError(f"'{dotted}' must be true or false, got {value!r}")
-    return value
+def _require_positive_int(d: Dict, key: str, section: str) -> int:
+    val = d.get(key)
+    if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+        raise ConfigError(
+            f"[{section}] '{key}' must be a positive integer, got {val!r}"
+        )
+    return int(val)
 
 
-def _expect_int(value: Any, dotted: str, minimum: Optional[int] = None,
-                maximum: Optional[int] = None) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigError(f"'{dotted}' must be an integer, got {value!r}")
-    if minimum is not None and value < minimum:
-        raise ConfigError(f"'{dotted}' must be >= {minimum}, got {value}")
-    if maximum is not None and value > maximum:
-        raise ConfigError(f"'{dotted}' must be <= {maximum}, got {value}")
-    return value
+def _require_positive_float(d: Dict, key: str, section: str) -> float:
+    val = d.get(key)
+    if not isinstance(val, (int, float)) or isinstance(val, bool) or val <= 0:
+        raise ConfigError(
+            f"[{section}] '{key}' must be a positive number, got {val!r}"
+        )
+    return float(val)
 
 
-def _expect_number(value: Any, dotted: str, minimum: Optional[float] = None,
-                   maximum: Optional[float] = None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ConfigError(f"'{dotted}' must be a number, got {value!r}")
-    number = float(value)
-    if minimum is not None and number < minimum:
-        raise ConfigError(f"'{dotted}' must be >= {minimum}, got {number}")
-    if maximum is not None and number > maximum:
-        raise ConfigError(f"'{dotted}' must be <= {maximum}, got {number}")
-    return number
+def _require_string(d: Dict, key: str, section: str) -> str:
+    val = d.get(key)
+    if not isinstance(val, str) or not val.strip():
+        raise ConfigError(
+            f"[{section}] '{key}' must be a non-empty string, got {val!r}"
+        )
+    return val
 
 
-def _expect_str(value: Any, dotted: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ConfigError(f"'{dotted}' must be a non-empty string, got {value!r}")
-    return value.strip()
-
-
-def _expect_list(value: Any, dotted: str) -> List[Any]:
-    if not isinstance(value, list):
-        raise ConfigError(f"'{dotted}' must be a JSON array, got {type(value).__name__}")
-    return value
-
-
-def _expect_ip_list(value: Any, dotted: str) -> List[str]:
-    items = _expect_list(value, dotted)
-    result: List[str] = []
-    for item in items:
+def _optional_string_list(d: Dict, key: str, section: str) -> List[str]:
+    val = d.get(key, [])
+    if not isinstance(val, list):
+        raise ConfigError(f"[{section}] '{key}' must be a list of strings")
+    for item in val:
         if not isinstance(item, str):
-            raise ConfigError(f"'{dotted}' must contain strings, got {item!r}")
-        try:
-            result.append(str(ipaddress.ip_address(item.strip())))
-        except ValueError as exc:
             raise ConfigError(
-                f"'{dotted}' contains an invalid IP address {item!r}: {exc}"
-            ) from exc
-    return result
-
-
-def _expect_network_list(value: Any, dotted: str) -> List[str]:
-    items = _expect_list(value, dotted)
-    result: List[str] = []
-    for item in items:
-        if not isinstance(item, str):
-            raise ConfigError(f"'{dotted}' must contain strings, got {item!r}")
-        try:
-            result.append(str(ipaddress.ip_network(item.strip(), strict=False)))
-        except ValueError as exc:
-            raise ConfigError(
-                f"'{dotted}' contains an invalid network {item!r}: {exc}"
-            ) from exc
-    return result
-
-
-def _expect_port_list(value: Any, dotted: str) -> List[int]:
-    items = _expect_list(value, dotted)
-    for item in items:
-        if isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 65535:
-            raise ConfigError(
-                f"'{dotted}' must contain integers between 0 and 65535, got {item!r}"
+                f"[{section}] '{key}' must contain only strings, found {item!r}"
             )
-    return items
+    return val
 
 
-def _expect_str_map(value: Any, dotted: str) -> Dict[str, str]:
-    mapping = _expect_mapping(value, dotted)
-    result: Dict[str, str] = {}
-    for key, item in mapping.items():
-        if not isinstance(item, str):
-            raise ConfigError(f"'{dotted}.{key}' must be a string, got {item!r}")
-        result[str(key)] = item.strip()
-    return result
-
-
-# --------------------------------------------------------------------------
-# Section validators
-# --------------------------------------------------------------------------
-
-def _validate_output_dirs(cfg: Dict[str, Any]) -> None:
-    dirs = _expect_mapping(cfg.get("output_dirs"), "output_dirs")
-    for key in OUTPUT_DIR_KEYS:
-        _expect_str(dirs.get(key), f"output_dirs.{key}")
-
-
-def _validate_retention(cfg: Dict[str, Any]) -> None:
-    retention = _expect_mapping(cfg.get("retention"), "retention")
-    _expect_int(retention.get("max_in_memory_alerts"),
-                "retention.max_in_memory_alerts", minimum=1)
-
-
-def _validate_deduplication(cfg: Dict[str, Any]) -> None:
-    dedup = _expect_mapping(cfg.get("deduplication"), "deduplication")
-    _expect_number(dedup.get("suppression_window_seconds"),
-                   "deduplication.suppression_window_seconds", minimum=0.0)
-
-
-def _validate_network_scope(cfg: Dict[str, Any]) -> None:
-    scope = _expect_mapping(cfg.get("network_scope"), "network_scope")
-    enabled = _expect_bool(scope.get("enabled"), "network_scope.enabled")
-    networks = _expect_network_list(scope.get("local_networks"),
-                                    "network_scope.local_networks")
-    if enabled and not networks:
-        raise ConfigError(
-            "network_scope.enabled is true but network_scope.local_networks is "
-            "empty; provide at least one CIDR range or disable the scope filter"
-        )
-
-
-def _validate_severity(cfg: Dict[str, Any]) -> None:
-    severity = _expect_str_map(cfg.get("severity"), "severity")
-    missing = [rule for rule in KNOWN_RULES if rule not in severity]
-    if missing:
-        raise ConfigError(
-            f"'severity' is missing an entry for rule(s): {', '.join(missing)}"
-        )
-    unknown = [rule for rule in severity if rule not in KNOWN_RULES]
-    if unknown:
-        raise ConfigError(
-            f"'severity' contains unknown rule id(s): {', '.join(sorted(unknown))}"
-        )
-    for rule, level in severity.items():
-        if level.lower() not in SEVERITY_LEVELS:
+def _optional_string_dict(d: Dict, key: str, section: str) -> Dict[str, str]:
+    val = d.get(key, {})
+    if not isinstance(val, dict):
+        raise ConfigError(f"[{section}] '{key}' must be an object (dict)")
+    for k, v in val.items():
+        if not isinstance(k, str) or not isinstance(v, str):
             raise ConfigError(
-                f"'severity.{rule}' must be one of {SEVERITY_LEVELS}, got {level!r}"
+                f"[{section}] '{key}' must map strings to strings"
             )
+    return val
 
 
-def _validate_trusted_hosts(cfg: Dict[str, Any]) -> None:
-    _expect_ip_list(cfg.get("trusted_hosts"), "trusted_hosts")
+# ---------------------------------------------------------------------------
+# Section parsers
+# ---------------------------------------------------------------------------
+
+def _parse_tcp(d: Dict) -> TcpConfig:
+    s = "tcp"
+    return TcpConfig(
+        enabled=_require_bool(d, "enabled", s),
+        syn_port_threshold=_require_positive_int(d, "syn_port_threshold", s),
+        observation_window_seconds=_require_positive_int(
+            d, "observation_window_seconds", s
+        ),
+        excluded_sources=_optional_string_list(d, "excluded_sources", s),
+    )
 
 
-def _validate_detection_tcp(section: Dict[str, Any]) -> None:
-    tcp = _expect_mapping(section.get("tcp"), "detection.tcp")
-    _expect_bool(tcp.get("enabled"), "detection.tcp.enabled")
-    _expect_number(tcp.get("window_seconds"),
-                   "detection.tcp.window_seconds", minimum=0.001)
-    _expect_int(tcp.get("distinct_destination_ports"),
-                "detection.tcp.distinct_destination_ports", minimum=2)
-    _expect_port_list(tcp.get("excluded_destination_ports"),
-                      "detection.tcp.excluded_destination_ports")
-    _expect_int(tcp.get("max_tracked_sources"),
-                "detection.tcp.max_tracked_sources", minimum=1)
+def _parse_udp(d: Dict) -> UdpConfig:
+    s = "udp"
+    return UdpConfig(
+        enabled=_require_bool(d, "enabled", s),
+        port_diversity_threshold=_require_positive_int(
+            d, "port_diversity_threshold", s
+        ),
+        observation_window_seconds=_require_positive_int(
+            d, "observation_window_seconds", s
+        ),
+        excluded_sources=_optional_string_list(d, "excluded_sources", s),
+    )
 
 
-def _validate_detection_udp(section: Dict[str, Any]) -> None:
-    udp = _expect_mapping(section.get("udp"), "detection.udp")
-    _expect_bool(udp.get("enabled"), "detection.udp.enabled")
-    _expect_number(udp.get("window_seconds"),
-                   "detection.udp.window_seconds", minimum=0.001)
-    _expect_int(udp.get("distinct_destination_ports"),
-                "detection.udp.distinct_destination_ports", minimum=2)
-    _expect_int(udp.get("max_tracked_sources"),
-                "detection.udp.max_tracked_sources", minimum=1)
+def _parse_icmp(d: Dict) -> IcmpConfig:
+    s = "icmp"
+    return IcmpConfig(
+        enabled=_require_bool(d, "enabled", s),
+        echo_request_threshold=_require_positive_int(
+            d, "echo_request_threshold", s
+        ),
+        observation_window_seconds=_require_positive_int(
+            d, "observation_window_seconds", s
+        ),
+        excluded_sources=_optional_string_list(d, "excluded_sources", s),
+    )
 
 
-def _validate_detection_icmp(section: Dict[str, Any]) -> None:
-    icmp = _expect_mapping(section.get("icmp"), "detection.icmp")
-    _expect_bool(icmp.get("enabled"), "detection.icmp.enabled")
-    _expect_number(icmp.get("window_seconds"),
-                   "detection.icmp.window_seconds", minimum=0.001)
-    _expect_int(icmp.get("echo_requests"),
-                "detection.icmp.echo_requests", minimum=2)
-    _expect_int(icmp.get("max_tracked_sources"),
-                "detection.icmp.max_tracked_sources", minimum=1)
+def _parse_arp(d: Dict) -> ArpConfig:
+    s = "arp"
+    return ArpConfig(
+        enabled=_require_bool(d, "enabled", s),
+        mapping_expiry_seconds=_require_positive_int(
+            d, "mapping_expiry_seconds", s
+        ),
+        trusted_mappings=_optional_string_dict(d, "trusted_mappings", s),
+        max_table_size=_require_positive_int(d, "max_table_size", s),
+    )
 
 
-def _validate_detection_arp(section: Dict[str, Any]) -> None:
-    arp = _expect_mapping(section.get("arp"), "detection.arp")
-    _expect_bool(arp.get("enabled"), "detection.arp.enabled")
-    _expect_number(arp.get("mapping_ttl_seconds"),
-                   "detection.arp.mapping_ttl_seconds", minimum=1.0)
-    _expect_int(arp.get("max_tracked_mappings"),
-                "detection.arp.max_tracked_mappings", minimum=1)
-
-    trusted = _expect_str_map(arp.get("trusted_mappings"),
-                              "detection.arp.trusted_mappings")
-    for key, value in trusted.items():
-        try:
-            ipaddress.ip_address(key)
-        except ValueError as exc:
-            raise ConfigError(
-                f"'detection.arp.trusted_mappings' key {key!r} is not a valid IP: {exc}"
-            ) from exc
-        normalised = value.lower().replace("-", ":")
-        if len(normalised.replace(":", "")) != 12:
-            raise ConfigError(
-                f"'detection.arp.trusted_mappings.{key}' is not a valid MAC: {value!r}"
-            )
+def _parse_dns(d: Dict) -> DnsConfig:
+    s = "dns"
+    return DnsConfig(
+        enabled=_require_bool(d, "enabled", s),
+        query_rate_threshold=_require_positive_int(
+            d, "query_rate_threshold", s
+        ),
+        observation_window_seconds=_require_positive_int(
+            d, "observation_window_seconds", s
+        ),
+        nxdomain_threshold=_require_positive_int(d, "nxdomain_threshold", s),
+        nxdomain_window_seconds=_require_positive_int(
+            d, "nxdomain_window_seconds", s
+        ),
+        excluded_sources=_optional_string_list(d, "excluded_sources", s),
+    )
 
 
-def _validate_detection_dns(section: Dict[str, Any]) -> None:
-    dns = _expect_mapping(section.get("dns"), "detection.dns")
-    _expect_bool(dns.get("enabled"), "detection.dns.enabled")
-    _expect_number(dns.get("query_window_seconds"),
-                   "detection.dns.query_window_seconds", minimum=0.001)
-    _expect_int(dns.get("queries_per_source"),
-                "detection.dns.queries_per_source", minimum=2)
-    _expect_int(dns.get("max_tracked_sources"),
-                "detection.dns.max_tracked_sources", minimum=1)
-    _expect_number(dns.get("nxdomain_window_seconds"),
-                   "detection.dns.nxdomain_window_seconds", minimum=0.001)
-    _expect_int(dns.get("nxdomain_min_responses"),
-                "detection.dns.nxdomain_min_responses", minimum=1)
-    _expect_int(dns.get("nxdomain_min_count"),
-                "detection.dns.nxdomain_min_count", minimum=1)
-    ratio = _expect_number(dns.get("nxdomain_ratio"),
-                           "detection.dns.nxdomain_ratio",
-                           minimum=0.0, maximum=1.0)
+def _parse_baseline(d: Dict) -> BaselineConfig:
+    s = "baseline"
+    return BaselineConfig(
+        enabled=_require_bool(d, "enabled", s),
+        learning_duration_seconds=_require_positive_int(
+            d, "learning_duration_seconds", s
+        ),
+        baseline_file=_require_string(d, "baseline_file", s),
+        anomaly_multiplier=_require_positive_float(d, "anomaly_multiplier", s),
+    )
 
-    min_responses = int(dns["nxdomain_min_responses"])
-    min_count = int(dns["nxdomain_min_count"])
-    if min_count > min_responses:
+
+def _parse_output(d: Dict) -> OutputConfig:
+    s = "output"
+    return OutputConfig(
+        alerts_dir=_require_string(d, "alerts_dir", s),
+        reports_dir=_require_string(d, "reports_dir", s),
+        logs_dir=_require_string(d, "logs_dir", s),
+        data_dir=_require_string(d, "data_dir", s),
+        max_alerts_in_memory=_require_positive_int(
+            d, "max_alerts_in_memory", s
+        ),
+        alert_suppression_window_seconds=_require_positive_int(
+            d, "alert_suppression_window_seconds", s
+        ),
+        generate_report_on_exit=_require_bool(d, "generate_report_on_exit", s),
+    )
+
+
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
+
+
+def _parse_logging(d: Dict) -> LoggingConfig:
+    s = "logging"
+    level = _require_string(d, "level", s).upper()
+    if level not in _VALID_LOG_LEVELS:
         raise ConfigError(
-            "detection.dns.nxdomain_min_count "
-            f"({min_count}) cannot exceed "
-            f"detection.dns.nxdomain_min_responses ({min_responses})"
+            f"[logging] 'level' must be one of {sorted(_VALID_LOG_LEVELS)}, "
+            f"got {level!r}"
         )
-    if ratio == 0.0 and min_count > 0:
-        raise ConfigError(
-            "detection.dns.nxdomain_ratio of 0.0 would make DNS-002 fire on "
-            "every response; set a value greater than 0.0"
-        )
+    return LoggingConfig(
+        level=level,
+        log_to_file=_require_bool(d, "log_to_file", s),
+        log_filename=_require_string(d, "log_filename", s),
+    )
 
 
-def _validate_detection(cfg: Dict[str, Any]) -> None:
-    detection = _expect_mapping(cfg.get("detection"), "detection")
-    _validate_detection_tcp(detection)
-    _validate_detection_udp(detection)
-    _validate_detection_icmp(detection)
-    _validate_detection_arp(detection)
-    _validate_detection_dns(detection)
-
-
-def _validate_baseline(cfg: Dict[str, Any]) -> None:
-    baseline = _expect_mapping(cfg.get("baseline"), "baseline")
-    _expect_bool(baseline.get("enabled"), "baseline.enabled")
-    _expect_bool(baseline.get("learning_mode"), "baseline.learning_mode")
-    _expect_number(baseline.get("observation_seconds"),
-                   "baseline.observation_seconds", minimum=1.0)
-    _expect_str(baseline.get("baseline_file"), "baseline.baseline_file")
-
-
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Public API
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-def validate_config(config: Any) -> Dict[str, Any]:
-    """Validate ``config`` in place and return it.
-
-    Raises :class:`ConfigError` with an actionable message on the first
-    problem found.
+def load_config(path: Path) -> Config:
     """
-    cfg = _expect_mapping(config, "<root>")
+    Load and validate the configuration file at *path*.
 
-    log_level = _expect_str(cfg.get("log_level"), "log_level").upper()
-    if log_level not in LOG_LEVELS:
+    Returns a populated Config dataclass on success.
+    Raises ConfigError with an actionable message on failure.
+    """
+    if not path.exists():
         raise ConfigError(
-            f"'log_level' must be one of {LOG_LEVELS}, got {log_level!r}"
+            f"Configuration file not found: {path}\n"
+            "Create or restore config.json from the project template."
         )
-    cfg["log_level"] = log_level
-
-    _validate_output_dirs(cfg)
-    _validate_retention(cfg)
-    _validate_deduplication(cfg)
-    _validate_network_scope(cfg)
-    _validate_severity(cfg)
-    _validate_trusted_hosts(cfg)
-    _validate_detection(cfg)
-    _validate_baseline(cfg)
-    return cfg
-
-
-def load_config(path: Optional[str] = None) -> Dict[str, Any]:
-    """Load, validate and return ``config.json``.
-
-    ``path`` defaults to ``config.json`` in the current working directory.
-    """
-    config_path = Path(path) if path else Path(DEFAULT_CONFIG_FILENAME)
-
-    if not config_path.is_file():
-        raise ConfigError(f"Configuration file not found: {config_path}")
 
     try:
-        raw = config_path.read_text(encoding="utf-8")
+        raw_text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise ConfigError(f"Unable to read configuration {config_path}: {exc}") from exc
+        raise ConfigError(f"Cannot read configuration file: {exc}") from exc
 
     try:
-        data = json.loads(raw)
+        data: Any = json.loads(raw_text)
     except json.JSONDecodeError as exc:
         raise ConfigError(
-            f"{config_path} is not valid JSON (line {exc.lineno}, column "
-            f"{exc.colno}): {exc.msg}"
+            f"Configuration file is not valid JSON: {exc}\n"
+            f"Check {path} for syntax errors (trailing commas, missing quotes)."
         ) from exc
 
-    cfg = validate_config(data)
-    cfg["_config_path"] = str(config_path)
-    return cfg
+    if not isinstance(data, dict):
+        raise ConfigError("Configuration file must contain a JSON object at the top level.")
+
+    # Validate and parse each section.  Missing sections use defaults.
+    required_sections = {
+        "tcp": _parse_tcp,
+        "udp": _parse_udp,
+        "icmp": _parse_icmp,
+        "arp": _parse_arp,
+        "dns": _parse_dns,
+        "baseline": _parse_baseline,
+        "output": _parse_output,
+        "logging": _parse_logging,
+    }
+
+    parsed: Dict[str, Any] = {}
+    for section, parser in required_sections.items():
+        section_data = data.get(section)
+        if section_data is None:
+            raise ConfigError(
+                f"Required configuration section '{section}' is missing.\n"
+                f"Add a '{section}' block to {path}."
+            )
+        if not isinstance(section_data, dict):
+            raise ConfigError(
+                f"Configuration section '{section}' must be a JSON object, "
+                f"got {type(section_data).__name__!r}"
+            )
+        try:
+            parsed[section] = parser(section_data)
+        except ConfigError:
+            raise  # Re-raise with the message already set by the helper.
+
+    # Optional: local_networks
+    local_networks: List[str] = []
+    raw_nets = data.get("local_networks", [])
+    if not isinstance(raw_nets, list):
+        raise ConfigError("'local_networks' must be a list of CIDR strings.")
+    for net in raw_nets:
+        if not isinstance(net, str):
+            raise ConfigError(f"'local_networks' entries must be strings, got {net!r}")
+        # Basic sanity check — full CIDR validation happens in the caller.
+        if "/" not in net:
+            raise ConfigError(
+                f"'local_networks' entry {net!r} does not look like a CIDR "
+                "(e.g. '192.168.1.0/24')."
+            )
+        local_networks.append(net)
+
+    config = Config(
+        tcp=parsed["tcp"],
+        udp=parsed["udp"],
+        icmp=parsed["icmp"],
+        arp=parsed["arp"],
+        dns=parsed["dns"],
+        baseline=parsed["baseline"],
+        output=parsed["output"],
+        logging=parsed["logging"],
+        local_networks=local_networks,
+    )
+
+    logger.debug("Configuration loaded successfully from %s", path)
+    return config
 
 
-def output_path(config: Mapping[str, Any], key: str, filename: str) -> Path:
-    """Return ``<output_dirs[key]>/<filename>`` as a :class:`Path`.
-
-    ``key`` must be one of :data:`OUTPUT_DIR_KEYS`; anything else is a
-    programming error and raises :class:`ConfigError`.
+def load_config_or_defaults(path: Path) -> Config:
     """
-    if key not in OUTPUT_DIR_KEYS:
-        raise ConfigError(
-            f"Unknown output directory key {key!r}; expected one of {OUTPUT_DIR_KEYS}"
-        )
-    return Path(config["output_dirs"][key]) / filename
+    Attempt to load the configuration file.  If it cannot be read or parsed,
+    log a warning and return the built-in defaults.
+
+    Use this only in contexts where continuing with defaults is explicitly
+    acceptable (e.g. --show-config before a configuration file exists).
+    """
+    try:
+        return load_config(path)
+    except ConfigError as exc:
+        logger.warning("Using built-in defaults because config failed to load: %s", exc)
+        return Config()

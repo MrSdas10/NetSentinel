@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2025 NetSentinel contributors
+Copyright (c) 2024 NetSentinel Contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -22,16 +22,12 @@ SOFTWARE.
 
 ---
 
-Ethical use notice
+ETHICAL USE NOTICE
 
-NetSentinel is a defensive monitoring tool.  It captures packets on a network
-interface, which means it can observe traffic that is not addressed to the
-machine running it when the interface is in promiscuous mode.  You must only
-run NetSentinel on:
+This software is designed exclusively for defensive security monitoring on
+networks that the operator owns or has written authorization to monitor.
 
-  * Networks that you own, or
-  * Networks on which you have explicit written authorisation to monitor.
+Use of this tool on networks without explicit written authorization is illegal
+in most jurisdictions and is strictly prohibited.
 
-Unauthorised packet capture may violate computer-misuse, wiretapping, privacy
-and telecommunications laws in your jurisdiction.  The authors of NetSentinel
-accept no liability for misuse of this software.
+The authors accept no responsibility for misuse of this software.

@@ -1,98 +1,156 @@
-"""Tests for the TCP-001 destination-port diversity rule."""
+"""
+test_tcp_detection.py — Tests for TCP-001 (port scan detection).
 
-from __future__ import annotations
+Uses a controllable clock to avoid real-time delays.
+"""
 
+import sys
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from scapy.layers.l2 import Ether
+from scapy.layers.inet import IP, TCP
+
+from config_loader import Config, TcpConfig
 from alert_manager import TcpPortScanRule
-from parsers import ParsedPacket
-from utils import to_utc_iso
-
-EPOCH = 1_700_000_000.0
+from parsers import parse_packet
 
 
-def _syn(src_ip: str, dst_ip: str, dst_port: int, epoch: float) -> ParsedPacket:
-    return ParsedPacket(
-        timestamp_utc=to_utc_iso(epoch),
-        timestamp_epoch=epoch,
-        src_ip=src_ip,
-        dst_ip=dst_ip,
-        dst_port=dst_port,
-        tcp_syn=True,
-        tcp_ack=False,
-        tcp_flags="S",
-        ip_proto=6,
-        protocol="TCP",
+def _make_syn(src="10.0.0.1", dst="10.0.0.2", dport=80):
+    return parse_packet(
+        Ether() / IP(src=src, dst=dst) / TCP(sport=50000, dport=dport, flags="S")
     )
 
 
-class TcpPortScanRuleTests(unittest.TestCase):
+def _make_config(threshold=5, window=60, excluded=None):
+    config = Config()
+    config.tcp = TcpConfig(
+        enabled=True,
+        syn_port_threshold=threshold,
+        observation_window_seconds=window,
+        excluded_sources=excluded or [],
+    )
+    return config
 
-    def test_below_threshold_does_not_fire(self):
-        rule = TcpPortScanRule(window_seconds=10, threshold=20)
-        for i, port in enumerate([80, 443, 22, 25, 53]):
-            result = rule.process(_syn("10.0.0.1", "10.0.0.2", port, EPOCH + i * 0.1), EPOCH + i * 0.1)
-            self.assertIsNone(result)
 
-    def test_above_threshold_fires_once_ports_cross(self):
-        rule = TcpPortScanRule(window_seconds=10, threshold=5)
-        alert = None
-        for i in range(6):
-            alert = rule.process(
-                _syn("10.0.0.1", "10.0.0.2", 1000 + i, EPOCH + i * 0.1),
-                EPOCH + i * 0.1,
+class TestTcpPortScanAboveThreshold(unittest.TestCase):
+    """TCP-001 MUST trigger when distinct ports exceed the threshold."""
+
+    def test_triggers_above_threshold(self):
+        fake_time = [0.0]
+
+        def clock():
+            return fake_time[0]
+
+        config = _make_config(threshold=5, window=60)
+        rule = TcpPortScanRule(config, time_fn=clock)
+
+        # Send SYNs to 5 distinct ports; alert should appear on the 5th.
+        results = []
+        for port in range(80, 85):  # ports 80–84 = 5 distinct
+            pkt = _make_syn(dport=port)
+            evidence = rule.process(pkt)
+            results.append(evidence)
+
+        # At least the last call should have produced evidence.
+        self.assertIsNotNone(results[-1])
+        self.assertEqual(results[-1]["rule_id"], "TCP-001")
+        self.assertGreaterEqual(results[-1]["distinct_dst_ports"], 5)
+
+    def test_evidence_contains_required_fields(self):
+        fake_time = [0.0]
+        config = _make_config(threshold=3)
+        rule = TcpPortScanRule(config, time_fn=lambda: fake_time[0])
+
+        evidence = None
+        for port in range(100, 104):
+            evidence = rule.process(_make_syn(dport=port))
+
+        self.assertIsNotNone(evidence)
+        for field in ("distinct_dst_ports", "threshold",
+                      "observation_window_seconds", "source_ip"):
+            self.assertIn(field, evidence, f"Missing field: {field}")
+
+
+class TestTcpPortScanBelowThreshold(unittest.TestCase):
+    """TCP-001 must NOT trigger below the threshold."""
+
+    def test_no_alert_below_threshold(self):
+        config = _make_config(threshold=10)
+        rule = TcpPortScanRule(config, time_fn=lambda: 0.0)
+
+        for port in range(80, 85):  # only 5 ports, threshold is 10
+            evidence = rule.process(_make_syn(dport=port))
+            self.assertIsNone(evidence)
+
+    def test_single_syn_no_alert(self):
+        config = _make_config(threshold=5)
+        rule = TcpPortScanRule(config, time_fn=lambda: 0.0)
+        evidence = rule.process(_make_syn(dport=443))
+        self.assertIsNone(evidence)
+
+
+class TestTcpExcludedSource(unittest.TestCase):
+    def test_excluded_source_never_triggers(self):
+        config = _make_config(threshold=2, excluded=["10.0.0.1"])
+        rule = TcpPortScanRule(config, time_fn=lambda: 0.0)
+        for port in range(80, 90):
+            evidence = rule.process(_make_syn(src="10.0.0.1", dport=port))
+            self.assertIsNone(evidence)
+
+
+class TestTcpSlidingWindowExpiry(unittest.TestCase):
+    """Ports seen before the window should not count."""
+
+    def test_old_ports_expire_from_window(self):
+        current_time = [0.0]
+
+        def clock():
+            return current_time[0]
+
+        config = _make_config(threshold=5, window=30)
+        rule = TcpPortScanRule(config, time_fn=clock)
+
+        # Add 4 ports at t=0
+        for port in range(80, 84):
+            rule.process(_make_syn(dport=port))
+
+        # Advance time past the window.
+        current_time[0] = 31.0
+
+        # Add 1 more port — should not trigger because the old ones expired.
+        evidence = rule.process(_make_syn(dport=90))
+        self.assertIsNone(evidence)
+
+
+class TestTcpSynAckNotCounted(unittest.TestCase):
+    """SYN-ACK packets must not be counted as port scan indicators."""
+
+    def test_syn_ack_not_counted(self):
+        config = _make_config(threshold=3)
+        rule = TcpPortScanRule(config, time_fn=lambda: 0.0)
+
+        for port in range(80, 90):
+            pkt = parse_packet(
+                Ether()
+                / IP(src="10.0.0.1", dst="10.0.0.2")
+                / TCP(sport=50000, dport=port, flags="SA")
             )
-        self.assertIsNotNone(alert)
-        assert alert is not None
-        self.assertEqual(alert.rule_id, "TCP-001")
-        self.assertEqual(alert.source_ip, "10.0.0.1")
-        self.assertGreaterEqual(alert.evidence["distinct_destination_ports"], 5)
-
-    def test_retransmissions_to_same_port_do_not_count_as_distinct(self):
-        rule = TcpPortScanRule(window_seconds=10, threshold=3)
-        for i in range(10):
-            result = rule.process(
-                _syn("10.0.0.1", "10.0.0.2", 80, EPOCH + i * 0.1),
-                EPOCH + i * 0.1,
-            )
-            self.assertIsNone(result)
-
-    def test_outside_window_ports_expire(self):
-        rule = TcpPortScanRule(window_seconds=1.0, threshold=3)
-        # Two ports at t=0, two more at t=5 (outside window). Should not fire.
-        rule.process(_syn("10.0.0.1", "10.0.0.2", 80, EPOCH), EPOCH)
-        rule.process(_syn("10.0.0.1", "10.0.0.2", 81, EPOCH + 0.1), EPOCH + 0.1)
-        result = rule.process(
-            _syn("10.0.0.1", "10.0.0.2", 82, EPOCH + 5.0), EPOCH + 5.0
-        )
-        self.assertIsNone(result)
-
-    def test_syn_ack_does_not_count(self):
-        rule = TcpPortScanRule(window_seconds=10, threshold=2)
-        pkt = _syn("10.0.0.1", "10.0.0.2", 80, EPOCH)
-        pkt.tcp_ack = True  # SYN+ACK is a response, not a connection attempt
-        self.assertIsNone(rule.process(pkt, EPOCH))
-
-    def test_trusted_host_is_exempt(self):
-        rule = TcpPortScanRule(
-            window_seconds=10, threshold=3, trusted_hosts={"10.0.0.5"}
-        )
-        for i in range(10):
-            result = rule.process(
-                _syn("10.0.0.5", "10.0.0.2", 100 + i, EPOCH + i * 0.1),
-                EPOCH + i * 0.1,
-            )
-            self.assertIsNone(result)
-
-    def test_excluded_destination_ports_are_ignored(self):
-        rule = TcpPortScanRule(window_seconds=10, threshold=3, excluded_ports=[80, 443])
-        for i in range(10):
-            result = rule.process(
-                _syn("10.0.0.1", "10.0.0.2", 80 if i % 2 else 443, EPOCH + i * 0.1),
-                EPOCH + i * 0.1,
-            )
-            self.assertIsNone(result)
+            evidence = rule.process(pkt)
+            self.assertIsNone(evidence)
 
 
-if __name__ == "__main__":  # pragma: no cover
+class TestTcpDisabledRule(unittest.TestCase):
+    def test_disabled_never_triggers(self):
+        config = _make_config(threshold=1)
+        config.tcp.enabled = False
+        rule = TcpPortScanRule(config, time_fn=lambda: 0.0)
+        for port in range(80, 90):
+            self.assertIsNone(rule.process(_make_syn(dport=port)))
+
+
+if __name__ == "__main__":
     unittest.main()

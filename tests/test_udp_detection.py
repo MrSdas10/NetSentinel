@@ -1,73 +1,104 @@
-"""Tests for the UDP-001 destination-port diversity rule."""
+"""
+test_udp_detection.py — Tests for UDP-001 (port diversity detection).
+"""
 
-from __future__ import annotations
-
+import sys
 import unittest
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from scapy.layers.l2 import Ether
+from scapy.layers.inet import IP, UDP
+
+from config_loader import Config, UdpConfig
 from alert_manager import UdpPortDiversityRule
-from parsers import ParsedPacket
-from utils import to_utc_iso
-
-EPOCH = 1_700_000_000.0
+from parsers import parse_packet
 
 
-def _udp(src_ip: str, dst_ip: str, dst_port: int, epoch: float) -> ParsedPacket:
-    return ParsedPacket(
-        timestamp_utc=to_utc_iso(epoch),
-        timestamp_epoch=epoch,
-        src_ip=src_ip,
-        dst_ip=dst_ip,
-        dst_port=dst_port,
-        ip_proto=17,
-        protocol="UDP",
+def _make_udp(src="10.0.0.1", dst="10.0.0.2", dport=53):
+    return parse_packet(
+        Ether() / IP(src=src, dst=dst) / UDP(sport=50000, dport=dport)
     )
 
 
-class UdpPortDiversityRuleTests(unittest.TestCase):
-
-    def test_below_threshold_does_not_fire(self):
-        rule = UdpPortDiversityRule(window_seconds=10, threshold=10)
-        for i in range(5):
-            result = rule.process(
-                _udp("10.0.0.1", "10.0.0.2", 5000 + i, EPOCH + i * 0.1),
-                EPOCH + i * 0.1,
-            )
-            self.assertIsNone(result)
-
-    def test_above_threshold_fires(self):
-        rule = UdpPortDiversityRule(window_seconds=10, threshold=5)
-        alert = None
-        for i in range(6):
-            alert = rule.process(
-                _udp("10.0.0.1", "10.0.0.2", 5000 + i, EPOCH + i * 0.1),
-                EPOCH + i * 0.1,
-            )
-        self.assertIsNotNone(alert)
-        assert alert is not None
-        self.assertEqual(alert.rule_id, "UDP-001")
-        self.assertGreaterEqual(alert.evidence["distinct_destination_ports"], 5)
-        self.assertIn("note", alert.evidence)
-
-    def test_repeated_ports_do_not_inflate_count(self):
-        rule = UdpPortDiversityRule(window_seconds=10, threshold=3)
-        for i in range(20):
-            result = rule.process(
-                _udp("10.0.0.1", "10.0.0.2", 53, EPOCH + i * 0.05),
-                EPOCH + i * 0.05,
-            )
-            self.assertIsNone(result)
-
-    def test_trusted_host_is_exempt(self):
-        rule = UdpPortDiversityRule(
-            window_seconds=10, threshold=3, trusted_hosts={"10.0.0.9"}
-        )
-        for i in range(10):
-            result = rule.process(
-                _udp("10.0.0.9", "10.0.0.2", 1000 + i, EPOCH + i * 0.1),
-                EPOCH + i * 0.1,
-            )
-            self.assertIsNone(result)
+def _make_config(threshold=5, window=60, excluded=None):
+    config = Config()
+    config.udp = UdpConfig(
+        enabled=True,
+        port_diversity_threshold=threshold,
+        observation_window_seconds=window,
+        excluded_sources=excluded or [],
+    )
+    return config
 
 
-if __name__ == "__main__":  # pragma: no cover
+class TestUdpAboveThreshold(unittest.TestCase):
+    def test_triggers_at_threshold(self):
+        config = _make_config(threshold=5)
+        rule = UdpPortDiversityRule(config, time_fn=lambda: 0.0)
+        evidence = None
+        for port in range(1000, 1005):
+            evidence = rule.process(_make_udp(dport=port))
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["rule_id"], "UDP-001")
+
+    def test_evidence_fields(self):
+        config = _make_config(threshold=3)
+        rule = UdpPortDiversityRule(config, time_fn=lambda: 0.0)
+        evidence = None
+        for port in range(2000, 2003):
+            evidence = rule.process(_make_udp(dport=port))
+        self.assertIsNotNone(evidence)
+        self.assertIn("distinct_dst_ports", evidence)
+        self.assertIn("threshold", evidence)
+        self.assertIn("source_ip", evidence)
+
+
+class TestUdpBelowThreshold(unittest.TestCase):
+    def test_no_alert_below_threshold(self):
+        config = _make_config(threshold=10)
+        rule = UdpPortDiversityRule(config, time_fn=lambda: 0.0)
+        for port in range(53, 58):
+            evidence = rule.process(_make_udp(dport=port))
+            self.assertIsNone(evidence)
+
+
+class TestUdpExcludedSource(unittest.TestCase):
+    def test_excluded_source_no_alert(self):
+        config = _make_config(threshold=2, excluded=["10.0.0.1"])
+        rule = UdpPortDiversityRule(config, time_fn=lambda: 0.0)
+        for port in range(1, 100):
+            self.assertIsNone(rule.process(_make_udp(src="10.0.0.1", dport=port)))
+
+
+class TestUdpSlidingWindow(unittest.TestCase):
+    def test_old_entries_expire(self):
+        current_time = [0.0]
+
+        def clock():
+            return current_time[0]
+
+        config = _make_config(threshold=5, window=30)
+        rule = UdpPortDiversityRule(config, time_fn=clock)
+
+        for port in range(100, 104):
+            rule.process(_make_udp(dport=port))
+
+        current_time[0] = 35.0
+        # One more port after expiry — should not trigger.
+        evidence = rule.process(_make_udp(dport=200))
+        self.assertIsNone(evidence)
+
+
+class TestUdpDisabledRule(unittest.TestCase):
+    def test_disabled_never_triggers(self):
+        config = _make_config(threshold=1)
+        config.udp.enabled = False
+        rule = UdpPortDiversityRule(config, time_fn=lambda: 0.0)
+        for port in range(1, 100):
+            self.assertIsNone(rule.process(_make_udp(dport=port)))
+
+
+if __name__ == "__main__":
     unittest.main()

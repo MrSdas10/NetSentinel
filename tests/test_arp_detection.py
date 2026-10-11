@@ -1,98 +1,146 @@
-"""Tests for the ARP-001 mapping-change rule."""
+"""
+test_arp_detection.py — Tests for ARP-001 (mapping change detection).
+"""
 
-from __future__ import annotations
-
+import sys
 import unittest
+from pathlib import Path
 
-from alert_manager import ArpMappingChangeRule
-from parsers import ParsedPacket
-from utils import to_utc_iso
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-EPOCH = 1_700_000_000.0
+from scapy.layers.l2 import Ether, ARP
+
+from config_loader import Config, ArpConfig
+from alert_manager import ArpSpoofingRule
+from parsers import parse_packet, ARP_REPLY, ARP_REQUEST
 
 
-def _arp(sender_ip: str, sender_mac: str, target_ip: str, epoch: float) -> ParsedPacket:
-    return ParsedPacket(
-        timestamp_utc=to_utc_iso(epoch),
-        timestamp_epoch=epoch,
-        arp_op=2,  # ARP reply
-        arp_sender_ip=sender_ip,
-        arp_sender_mac=sender_mac,
-        arp_target_ip=target_ip,
-        arp_target_mac="00:00:00:00:00:00",
-        protocol="ARP",
+def _make_arp(src_ip, src_mac, op=ARP_REPLY, dst_ip="10.0.0.1"):
+    return parse_packet(
+        Ether(src=src_mac)
+        / ARP(op=op, psrc=src_ip, hwsrc=src_mac, pdst=dst_ip)
     )
 
 
-class ArpMappingChangeRuleTests(unittest.TestCase):
-
-    def test_first_observation_never_fires(self):
-        rule = ArpMappingChangeRule(mapping_ttl_seconds=600)
-        result = rule.process(
-            _arp("10.0.0.1", "aa:bb:cc:dd:ee:ff", "10.0.0.2", EPOCH), EPOCH
-        )
-        self.assertIsNone(result)
-
-    def test_repeated_same_mapping_does_not_fire(self):
-        rule = ArpMappingChangeRule(mapping_ttl_seconds=600)
-        for i in range(5):
-            result = rule.process(
-                _arp("10.0.0.1", "aa:bb:cc:dd:ee:ff", "10.0.0.2", EPOCH + i),
-                EPOCH + i,
-            )
-            self.assertIsNone(result)
-
-    def test_mapping_change_fires_with_evidence(self):
-        rule = ArpMappingChangeRule(mapping_ttl_seconds=600)
-        rule.process(_arp("10.0.0.1", "aa:bb:cc:dd:ee:ff", "10.0.0.2", EPOCH), EPOCH)
-        alert = rule.process(
-            _arp("10.0.0.1", "11:22:33:44:55:66", "10.0.0.2", EPOCH + 5),
-            EPOCH + 5,
-        )
-        self.assertIsNotNone(alert)
-        assert alert is not None
-        self.assertEqual(alert.rule_id, "ARP-001")
-        self.assertEqual(alert.evidence["ip_address"], "10.0.0.1")
-        self.assertEqual(alert.evidence["previous_mac"], "aa:bb:cc:dd:ee:ff")
-        self.assertEqual(alert.evidence["new_mac"], "11:22:33:44:55:66")
-        self.assertIn("note", alert.evidence)
-
-    def test_change_is_not_claimed_as_confirmed_attack(self):
-        rule = ArpMappingChangeRule(mapping_ttl_seconds=600)
-        rule.process(_arp("10.0.0.1", "aa:bb:cc:dd:ee:ff", "10.0.0.2", EPOCH), EPOCH)
-        alert = rule.process(
-            _arp("10.0.0.1", "11:22:33:44:55:66", "10.0.0.2", EPOCH + 5),
-            EPOCH + 5,
-        )
-        assert alert is not None
-        # Description must be descriptive, not definitive.
-        self.assertIn("changed", alert.description)
-        self.assertNotIn("attack", alert.description.lower())
-        self.assertNotIn("spoofing confirmed", alert.description.lower())
-
-    def test_stale_entry_expires(self):
-        rule = ArpMappingChangeRule(mapping_ttl_seconds=10)
-        rule.process(_arp("10.0.0.1", "aa:bb:cc:dd:ee:ff", "10.0.0.2", EPOCH), EPOCH)
-        # 100 seconds later: the old entry is stale, so a "changed" MAC does
-        # not produce an alert; it is treated as a fresh observation.
-        alert = rule.process(
-            _arp("10.0.0.1", "11:22:33:44:55:66", "10.0.0.2", EPOCH + 100),
-            EPOCH + 100,
-        )
-        self.assertIsNone(alert)
-
-    def test_trusted_mapping_ignores_first_observation(self):
-        rule = ArpMappingChangeRule(
-            mapping_ttl_seconds=600,
-            trusted_mappings={"10.0.0.5": "aa:bb:cc:dd:ee:ff"},
-        )
-        for _ in range(3):
-            result = rule.process(
-                _arp("10.0.0.5", "aa:bb:cc:dd:ee:ff", "10.0.0.1", EPOCH),
-                EPOCH,
-            )
-            self.assertIsNone(result)
+def _make_config(expiry=300, trusted=None, max_size=1024):
+    config = Config()
+    config.arp = ArpConfig(
+        enabled=True,
+        mapping_expiry_seconds=expiry,
+        trusted_mappings=trusted or {},
+        max_table_size=max_size,
+    )
+    return config
 
 
-if __name__ == "__main__":  # pragma: no cover
+class TestArpNewMapping(unittest.TestCase):
+    """First time we see an IP→MAC should not trigger."""
+
+    def test_first_seen_no_alert(self):
+        config = _make_config()
+        rule = ArpSpoofingRule(config, time_fn=lambda: 0.0)
+        evidence = rule.process(_make_arp("10.0.0.2", "aa:bb:cc:dd:ee:02"))
+        self.assertIsNone(evidence)
+
+
+class TestArpMappingChange(unittest.TestCase):
+    """A MAC change for an existing IP must produce evidence."""
+
+    def test_mac_change_triggers(self):
+        config = _make_config()
+        rule = ArpSpoofingRule(config, time_fn=lambda: 0.0)
+
+        # First packet: establish mapping.
+        rule.process(_make_arp("10.0.0.2", "aa:bb:cc:dd:ee:02"))
+
+        # Second packet: different MAC for same IP.
+        evidence = rule.process(_make_arp("10.0.0.2", "ff:ee:dd:cc:bb:aa"))
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["rule_id"], "ARP-001")
+        self.assertEqual(evidence["source_ip"], "10.0.0.2")
+        self.assertEqual(evidence["previous_mac"], "aa:bb:cc:dd:ee:02")
+        self.assertEqual(evidence["new_mac"], "ff:ee:dd:cc:bb:aa")
+
+    def test_evidence_contains_required_fields(self):
+        config = _make_config()
+        rule = ArpSpoofingRule(config, time_fn=lambda: 0.0)
+        rule.process(_make_arp("10.0.0.5", "11:22:33:44:55:66"))
+        evidence = rule.process(_make_arp("10.0.0.5", "aa:bb:cc:dd:ee:ff"))
+        self.assertIsNotNone(evidence)
+        for field in ("previous_mac", "new_mac", "source_ip", "rule_id"):
+            self.assertIn(field, evidence)
+
+
+class TestArpSameMacNoAlert(unittest.TestCase):
+    """Same MAC seen repeatedly must not trigger."""
+
+    def test_repeated_same_mac_no_alert(self):
+        config = _make_config()
+        rule = ArpSpoofingRule(config, time_fn=lambda: 0.0)
+        for _ in range(10):
+            evidence = rule.process(_make_arp("10.0.0.2", "aa:bb:cc:dd:ee:02"))
+            self.assertIsNone(evidence)
+
+
+class TestArpTrustedMapping(unittest.TestCase):
+    """Trusted IP→MAC pairs must never trigger an alert."""
+
+    def test_trusted_mac_no_alert(self):
+        trusted = {"10.0.0.2": "aa:bb:cc:dd:ee:02"}
+        config = _make_config(trusted=trusted)
+        rule = ArpSpoofingRule(config, time_fn=lambda: 0.0)
+
+        # Send the trusted mapping many times — no alert.
+        for _ in range(5):
+            evidence = rule.process(_make_arp("10.0.0.2", "aa:bb:cc:dd:ee:02"))
+            self.assertIsNone(evidence)
+
+
+class TestArpMappingExpiry(unittest.TestCase):
+    """Stale entries should be expired; a new mapping after expiry is not an alert."""
+
+    def test_expired_mapping_no_alert(self):
+        current_time = [0.0]
+
+        def clock():
+            return current_time[0]
+
+        config = _make_config(expiry=60)
+        rule = ArpSpoofingRule(config, time_fn=clock)
+
+        rule.process(_make_arp("10.0.0.2", "aa:bb:cc:dd:ee:02"))
+
+        # Advance time past expiry.
+        current_time[0] = 65.0
+
+        # Different MAC after expiry — should not alert (old entry is gone).
+        evidence = rule.process(_make_arp("10.0.0.2", "ff:ee:dd:cc:bb:aa"))
+        self.assertIsNone(evidence)
+
+
+class TestArpDisabledRule(unittest.TestCase):
+    def test_disabled_never_triggers(self):
+        config = _make_config()
+        config.arp.enabled = False
+        rule = ArpSpoofingRule(config, time_fn=lambda: 0.0)
+        rule.process(_make_arp("10.0.0.2", "aa:bb:cc:dd:ee:01"))
+        evidence = rule.process(_make_arp("10.0.0.2", "ff:ff:ff:ff:ff:ff"))
+        self.assertIsNone(evidence)
+
+
+class TestArpTableSizeBound(unittest.TestCase):
+    """Table must not grow beyond max_table_size."""
+
+    def test_table_does_not_exceed_max(self):
+        config = _make_config(max_size=10)
+        rule = ArpSpoofingRule(config, time_fn=lambda: 0.0)
+        for i in range(20):
+            ip = f"10.0.0.{i + 1}"
+            mac = f"aa:bb:cc:dd:ee:{i:02x}"
+            rule.process(_make_arp(ip, mac))
+        self.assertLessEqual(rule.table_size, 10)
+
+
+if __name__ == "__main__":
     unittest.main()

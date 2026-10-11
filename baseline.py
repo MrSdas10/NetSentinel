@@ -1,267 +1,341 @@
-"""Transparent behavioural baselining for NetSentinel.
-
-The baseline is intentionally simple: it records per-protocol counts, a set of
-observed hosts, and simple traffic-shape metrics during a learning window, then
-exposes a comparison that flags *new* hosts and *unusual* protocol shares.
-
-No machine learning is used.  Every decision is derived from counts that an
-analyst can inspect in ``data/baseline.json``.
-
-Baseline JSON schema (v1):
-
-    {
-      "version": 1,
-      "created_utc": "...",
-      "observation_seconds": 300,
-      "packets_observed": 12345,
-      "protocol_counts": {"TCP": 100, "UDP": 20, ...},
-      "observed_hosts": ["10.0.0.1", ...],
-      "top_talkers": {"10.0.0.1": 500, ...},
-      "protocol_share": {"TCP": 0.82, "UDP": 0.16, ...}
-    }
 """
+baseline.py — Lightweight behavioral baselining for NetSentinel.
 
-from __future__ import annotations
+Maintains protocol and host counts over a configurable learning period,
+persists the baseline to JSON, and supports comparison against live traffic.
+
+Design notes
+------------
+* No machine learning — only simple counters and explicit thresholds.
+* First-run or missing baseline files are handled gracefully.
+* Malformed baseline files do not crash the application.
+* The analyst can reset the baseline by deleting the JSON file or by
+  calling Baseline.reset().
+* Learning mode (is_learning=True) collects data; detection mode
+  (is_learning=False) compares against the stored baseline.
+"""
 
 import json
 import logging
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
+from typing import Dict, Optional
 
 from parsers import ParsedPacket
-from utils import NetSentinelError, atomic_write_text, to_utc_iso, utc_now
+from utils import utc_now_iso
 
-LOGGER = logging.getLogger(__name__)
-
-BASELINE_VERSION = 1
-TOP_TALKERS_LIMIT = 20
-# A protocol share is "unusual" when it is more than this factor different
-# from the learned share and the absolute difference is at least 5 points.
-_SHARE_FACTOR = 2.0
-_SHARE_MIN_DELTA = 0.05
+logger = logging.getLogger(__name__)
 
 
-class BaselineError(NetSentinelError):
-    """Raised for unrecoverable baseline file problems."""
+# ---------------------------------------------------------------------------
+# Snapshot dataclass — represents one baseline snapshot
+# ---------------------------------------------------------------------------
 
+@dataclass
+class BaselineSnapshot:
+    """
+    Protocol and host counters collected during a learning period.
+    Stored as / loaded from JSON.
+    """
+    created_utc: str = ""
+    learning_duration_seconds: int = 0
+    total_packets: int = 0
+    protocol_counts: Dict[str, int] = field(default_factory=dict)
+    # src_ip → packet count
+    host_counts: Dict[str, int] = field(default_factory=dict)
+    # src_ip → distinct dst_port count (TCP)
+    tcp_port_diversity: Dict[str, int] = field(default_factory=dict)
+    # src_ip → ICMP request count
+    icmp_request_counts: Dict[str, int] = field(default_factory=dict)
+    # src_ip → DNS query count
+    dns_query_counts: Dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "created_utc": self.created_utc,
+            "learning_duration_seconds": self.learning_duration_seconds,
+            "total_packets": self.total_packets,
+            "protocol_counts": self.protocol_counts,
+            "host_counts": self.host_counts,
+            "tcp_port_diversity": self.tcp_port_diversity,
+            "icmp_request_counts": self.icmp_request_counts,
+            "dns_query_counts": self.dns_query_counts,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BaselineSnapshot":
+        return cls(
+            created_utc=str(d.get("created_utc", "")),
+            learning_duration_seconds=int(d.get("learning_duration_seconds", 0)),
+            total_packets=int(d.get("total_packets", 0)),
+            protocol_counts=dict(d.get("protocol_counts", {})),
+            host_counts=dict(d.get("host_counts", {})),
+            tcp_port_diversity=dict(d.get("tcp_port_diversity", {})),
+            icmp_request_counts=dict(d.get("icmp_request_counts", {})),
+            dns_query_counts=dict(d.get("dns_query_counts", {})),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Comparison result
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BaselineComparison:
-    """Result of comparing current traffic against a stored baseline."""
-
-    has_baseline: bool
-    packets_observed: int = 0
-    new_hosts: List[str] = field(default_factory=list)
-    protocol_drift: Dict[str, Dict[str, float]] = field(default_factory=dict)
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "has_baseline": self.has_baseline,
-            "packets_observed": self.packets_observed,
-            "new_hosts": list(self.new_hosts),
-            "protocol_drift": dict(self.protocol_drift),
-        }
+    """Result of comparing current counters to the stored baseline."""
+    has_baseline: bool = False
+    tcp_diversity_anomalies: Dict[str, dict] = field(default_factory=dict)
+    icmp_anomalies: Dict[str, dict] = field(default_factory=dict)
+    dns_anomalies: Dict[str, dict] = field(default_factory=dict)
+    new_hosts: list = field(default_factory=list)
 
 
-class BaselineManager:
-    """Accumulate traffic statistics and compare against a stored baseline.
+# ---------------------------------------------------------------------------
+# Baseline class
+# ---------------------------------------------------------------------------
 
-    ``learning_mode`` selects whether ``observe`` merely records counts (for a
-    later ``save``) or also runs a comparison against a loaded baseline.
+class Baseline:
+    """
+    Manages learning-phase data collection and baseline comparison.
+
+    Usage
+    -----
+    1. Instantiate with the path to the baseline JSON file and the
+       learning duration (seconds).
+    2. Call update(packet) for each parsed packet.
+    3. After the learning period, call finalize() to compute and save the
+       snapshot.
+    4. On subsequent runs, load() restores the stored baseline.
+    5. Call compare(current_counters) to detect anomalies.
     """
 
     def __init__(
         self,
-        baseline_path: str | Path,
-        observation_seconds: float,
-        learning_mode: bool = False,
+        baseline_file: Path,
+        learning_duration_seconds: int,
+        anomaly_multiplier: float = 2.0,
     ) -> None:
-        if observation_seconds <= 0:
-            raise ValueError("observation_seconds must be positive")
+        self.baseline_file = baseline_file
+        self.learning_duration_seconds = learning_duration_seconds
+        self.anomaly_multiplier = anomaly_multiplier
 
-        self.path = Path(baseline_path)
-        self.observation_seconds = float(observation_seconds)
-        self.learning_mode = bool(learning_mode)
+        self.is_learning: bool = False
+        self._stored: Optional[BaselineSnapshot] = None
 
-        self._protocol_counts: Counter[str] = Counter()
-        self._host_counts: Counter[str] = Counter()
-        self._packets_observed = 0
-        self._started_utc = to_utc_iso(utc_now())
+        # Live accumulators (reset on each update cycle)
+        self._total_packets: int = 0
+        self._protocol_counts: Dict[str, int] = {}
+        self._host_counts: Dict[str, int] = {}
+        self._tcp_dst_ports: Dict[str, set] = {}
+        self._icmp_req_counts: Dict[str, int] = {}
+        self._dns_query_counts: Dict[str, int] = {}
 
-        self._baseline: Optional[Dict[str, Any]] = None
-        self._baseline_protocol_share: Dict[str, float] = {}
-        self._baseline_hosts: Set[str] = set()
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
-        if not self.learning_mode:
-            self._load_baseline()
+    def start_learning(self) -> None:
+        """Enter learning mode — updates will accumulate baseline data."""
+        logger.info("Baseline: learning mode started (%d s).",
+                    self.learning_duration_seconds)
+        self.is_learning = True
+        self.reset_accumulators()
+
+    def finalize(self) -> BaselineSnapshot:
+        """
+        Exit learning mode, compute the snapshot, save to disk, and return it.
+        """
+        self.is_learning = False
+        snapshot = BaselineSnapshot(
+            created_utc=utc_now_iso(),
+            learning_duration_seconds=self.learning_duration_seconds,
+            total_packets=self._total_packets,
+            protocol_counts=dict(self._protocol_counts),
+            host_counts=dict(self._host_counts),
+            tcp_port_diversity={
+                ip: len(ports) for ip, ports in self._tcp_dst_ports.items()
+            },
+            icmp_request_counts=dict(self._icmp_req_counts),
+            dns_query_counts=dict(self._dns_query_counts),
+        )
+        self._stored = snapshot
+        self._save(snapshot)
+        logger.info(
+            "Baseline finalized: %d packets, %d hosts.",
+            snapshot.total_packets, len(snapshot.host_counts),
+        )
+        return snapshot
+
+    def load(self) -> bool:
+        """
+        Load a previously saved baseline from disk.
+
+        Returns True on success, False if the file is absent or invalid.
+        A failed load does not raise — the caller continues without a baseline.
+        """
+        if not self.baseline_file.exists():
+            logger.info("No baseline file found at %s.", self.baseline_file)
+            return False
+
+        try:
+            raw = self.baseline_file.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("Baseline file root must be a JSON object.")
+            self._stored = BaselineSnapshot.from_dict(data)
+            logger.info(
+                "Baseline loaded: %d packets, created %s.",
+                self._stored.total_packets,
+                self._stored.created_utc,
+            )
+            return True
+        except (OSError, json.JSONDecodeError, ValueError, KeyError) as exc:
+            logger.warning(
+                "Could not load baseline from %s: %s. "
+                "Continuing without baseline comparison.",
+                self.baseline_file, exc,
+            )
+            self._stored = None
+            return False
+
+    def reset(self) -> None:
+        """
+        Delete the baseline file and clear in-memory state.
+        Allows the analyst to intentionally recreate a baseline.
+        """
+        if self.baseline_file.exists():
+            try:
+                self.baseline_file.unlink()
+                logger.info("Baseline file deleted: %s.", self.baseline_file)
+            except OSError as exc:
+                logger.warning("Could not delete baseline file: %s", exc)
+        self._stored = None
+        self.reset_accumulators()
+
+    def reset_accumulators(self) -> None:
+        """Clear live counters (does not affect the stored baseline)."""
+        self._total_packets = 0
+        self._protocol_counts = {}
+        self._host_counts = {}
+        self._tcp_dst_ports = {}
+        self._icmp_req_counts = {}
+        self._dns_query_counts = {}
+
+    # ------------------------------------------------------------------
+    # Update (called per packet)
+    # ------------------------------------------------------------------
+
+    def update(self, packet: ParsedPacket) -> None:
+        """
+        Feed a parsed packet into the live accumulators.
+
+        If is_learning is False, this method still tracks live data so that
+        compare() can compare against the stored baseline.
+        """
+        self._total_packets += 1
+
+        proto = packet.protocol or "UNKNOWN"
+        self._protocol_counts[proto] = self._protocol_counts.get(proto, 0) + 1
+
+        src = packet.src_ip
+        if src:
+            self._host_counts[src] = self._host_counts.get(src, 0) + 1
+
+        if packet.has_tcp and packet.is_syn and src and packet.dst_port is not None:
+            ports = self._tcp_dst_ports.setdefault(src, set())
+            ports.add(packet.dst_port)
+
+        if packet.is_echo_request and src:
+            self._icmp_req_counts[src] = self._icmp_req_counts.get(src, 0) + 1
+
+        if packet.is_dns and not packet.dns_is_response and src:
+            self._dns_query_counts[src] = self._dns_query_counts.get(src, 0) + 1
+
+    # ------------------------------------------------------------------
+    # Comparison
+    # ------------------------------------------------------------------
+
+    def compare(self) -> BaselineComparison:
+        """
+        Compare current live accumulators to the stored baseline.
+
+        Returns a BaselineComparison.  If no stored baseline exists,
+        has_baseline is False and all anomaly dicts are empty.
+        """
+        result = BaselineComparison(has_baseline=self._stored is not None)
+
+        if self._stored is None:
+            return result
+
+        baseline = self._stored
+        mult = self.anomaly_multiplier
+
+        # TCP port diversity anomalies
+        for ip, live_count in self._tcp_dst_ports.items():
+            baseline_count = baseline.tcp_port_diversity.get(ip, 0)
+            threshold = max(1, baseline_count * mult)
+            if len(live_count) > threshold:
+                result.tcp_diversity_anomalies[ip] = {
+                    "live_distinct_ports": len(live_count),
+                    "baseline_distinct_ports": baseline_count,
+                    "threshold": threshold,
+                }
+
+        # ICMP request anomalies
+        for ip, live_count in self._icmp_req_counts.items():
+            baseline_count = baseline.icmp_request_counts.get(ip, 0)
+            threshold = max(1, baseline_count * mult)
+            if live_count > threshold:
+                result.icmp_anomalies[ip] = {
+                    "live_requests": live_count,
+                    "baseline_requests": baseline_count,
+                    "threshold": threshold,
+                }
+
+        # DNS query anomalies
+        for ip, live_count in self._dns_query_counts.items():
+            baseline_count = baseline.dns_query_counts.get(ip, 0)
+            threshold = max(1, baseline_count * mult)
+            if live_count > threshold:
+                result.dns_anomalies[ip] = {
+                    "live_queries": live_count,
+                    "baseline_queries": baseline_count,
+                    "threshold": threshold,
+                }
+
+        # New hosts not seen during baseline
+        baseline_hosts = set(baseline.host_counts.keys())
+        for ip in self._host_counts:
+            if ip and ip not in baseline_hosts:
+                result.new_hosts.append(ip)
+
+        return result
+
+    @property
+    def stored_snapshot(self) -> Optional[BaselineSnapshot]:
+        """Return the currently loaded baseline snapshot, or None."""
+        return self._stored
+
+    @property
+    def live_protocol_counts(self) -> Dict[str, int]:
+        """Return a copy of the live protocol counter."""
+        return dict(self._protocol_counts)
+
+    @property
+    def live_total_packets(self) -> int:
+        return self._total_packets
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
-    def _load_baseline(self) -> None:
-        """Load an existing baseline if present and valid.
-
-        A missing baseline is not an error - the manager simply runs in
-        "first run" mode where ``has_baseline`` is False.  A malformed
-        baseline is logged and treated as absent rather than crashing the
-        application, because losing the baseline must not stop monitoring.
-        """
-        if not self.path.is_file():
-            LOGGER.info("No baseline file at %s; running without a baseline",
-                        self.path)
-            return
-
+    def _save(self, snapshot: BaselineSnapshot) -> None:
+        """Write the baseline snapshot to disk as JSON."""
         try:
-            raw = self.path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-        except (OSError, json.JSONDecodeError) as exc:
-            LOGGER.warning("Baseline file %s could not be read (%s); ignoring it",
-                           self.path, exc)
-            return
-
-        if not isinstance(data, dict) or data.get("version") != BASELINE_VERSION:
-            LOGGER.warning(
-                "Baseline file %s has an unsupported schema; ignoring it",
-                self.path,
+            self.baseline_file.parent.mkdir(parents=True, exist_ok=True)
+            self.baseline_file.write_text(
+                json.dumps(snapshot.to_dict(), indent=2), encoding="utf-8"
             )
-            return
-
-        self._baseline = data
-        share = data.get("protocol_share")
-        if isinstance(share, dict):
-            self._baseline_protocol_share = {
-                str(k): float(v) for k, v in share.items()
-                if isinstance(v, (int, float))
-            }
-        hosts = data.get("observed_hosts")
-        if isinstance(hosts, list):
-            self._baseline_hosts = {str(h) for h in hosts if isinstance(h, str)}
-        LOGGER.info(
-            "Loaded baseline from %s (%d observed hosts, %d protocol classes)",
-            self.path, len(self._baseline_hosts), len(self._baseline_protocol_share),
-        )
-
-    def save(self) -> Path:
-        """Write the current counters to disk and return the file path."""
-        total = sum(self._protocol_counts.values()) or 1
-        share = {
-            proto: count / total
-            for proto, count in self._protocol_counts.items()
-        }
-        top_talkers = dict(self._host_counts.most_common(TOP_TALKERS_LIMIT))
-
-        payload: Dict[str, Any] = {
-            "version": BASELINE_VERSION,
-            "created_utc": self._started_utc,
-            "saved_utc": to_utc_iso(utc_now()),
-            "observation_seconds": self.observation_seconds,
-            "packets_observed": self._packets_observed,
-            "protocol_counts": dict(self._protocol_counts),
-            "protocol_share": share,
-            "observed_hosts": sorted(self._host_counts.keys()),
-            "top_talkers": top_talkers,
-        }
-
-        text = json.dumps(payload, indent=2, ensure_ascii=False)
-        try:
-            atomic_write_text(self.path, text)
+            logger.info("Baseline saved to %s.", self.baseline_file)
         except OSError as exc:
-            raise BaselineError(f"Unable to write baseline {self.path}: {exc}") from exc
-
-        LOGGER.info("Baseline saved to %s (%d packets, %d hosts)",
-                    self.path, self._packets_observed, len(self._host_counts))
-        return self.path
-
-    def reset(self) -> None:
-        """Discard accumulated counters and any loaded baseline."""
-        self._protocol_counts.clear()
-        self._host_counts.clear()
-        self._packets_observed = 0
-        self._started_utc = to_utc_iso(utc_now())
-        self._baseline = None
-        self._baseline_protocol_share = {}
-        self._baseline_hosts = set()
-
-    # ------------------------------------------------------------------
-    # Observation
-    # ------------------------------------------------------------------
-
-    def observe(self, packet: ParsedPacket) -> None:
-        """Record one parsed packet against the baseline counters."""
-        self._packets_observed += 1
-        if packet.protocol:
-            self._protocol_counts[packet.protocol] += 1
-        for host in (packet.src_ip, packet.dst_ip,
-                     packet.arp_sender_ip, packet.arp_target_ip):
-            if host:
-                self._host_counts[host] += 1
-
-    def compare(self) -> BaselineComparison:
-        """Return a snapshot comparison against the loaded baseline."""
-        if self._baseline is None:
-            return BaselineComparison(
-                has_baseline=False,
-                packets_observed=self._packets_observed,
-            )
-
-        total = sum(self._protocol_counts.values()) or 1
-        current_share = {
-            proto: count / total for proto, count in self._protocol_counts.items()
-        }
-
-        drift: Dict[str, Dict[str, float]] = {}
-        all_protocols = set(current_share) | set(self._baseline_protocol_share)
-        for proto in sorted(all_protocols):
-            learned = self._baseline_protocol_share.get(proto, 0.0)
-            current = current_share.get(proto, 0.0)
-            delta = current - learned
-            if abs(delta) < _SHARE_MIN_DELTA:
-                continue
-            larger = max(learned, current)
-            smaller = max(min(learned, current), 1e-9)
-            if larger / smaller >= _SHARE_FACTOR:
-                drift[proto] = {
-                    "baseline_share": round(learned, 4),
-                    "current_share": round(current, 4),
-                    "delta": round(delta, 4),
-                }
-
-        new_hosts = sorted(set(self._host_counts) - self._baseline_hosts)
-        # Bound the reported list so a wide scan does not flood the summary.
-        new_hosts = new_hosts[:100]
-
-        return BaselineComparison(
-            has_baseline=True,
-            packets_observed=self._packets_observed,
-            new_hosts=new_hosts,
-            protocol_drift=drift,
-        )
-
-    # ------------------------------------------------------------------
-    # Accessors (used by the reporter)
-    # ------------------------------------------------------------------
-
-    @property
-    def has_baseline(self) -> bool:
-        return self._baseline is not None
-
-    @property
-    def learning_mode_active(self) -> bool:
-        return self.learning_mode
-
-    def summary(self) -> Dict[str, Any]:
-        """Return a small dictionary suitable for embedding in reports."""
-        return {
-            "learning_mode": self.learning_mode,
-            "has_baseline": self.has_baseline,
-            "observation_seconds": self.observation_seconds,
-            "packets_observed": self._packets_observed,
-            "protocol_counts": dict(self._protocol_counts),
-            "observed_hosts_count": len(self._host_counts),
-        }
-
-    def observed_hosts(self) -> Iterable[str]:
-        return tuple(self._host_counts.keys())
+            logger.error("Failed to save baseline: %s", exc)
