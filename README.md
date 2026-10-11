@@ -232,6 +232,9 @@ sudo python main.py --list-interfaces
 Offline analysis is the recommended method for testing and for sharing captures in a lab.
 
 ```bash
+# Use the given harmless synthetic test capture data (you can use your own as well)
+python make_test_pcap.py
+
 # Analyse a PCAP file and generate reports
 python main.py --offline captures/lab.pcap --report
 
