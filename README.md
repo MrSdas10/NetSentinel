@@ -114,6 +114,13 @@ it is not part of the packet-processing path.
 
 ## Prerequisites
 
+If you have not already opened a local checkout:
+
+```bash
+git clone https://github.com/MrSdas10/NetSentinel
+cd NetSentinel
+```
+
 - Python 3.11 or newer.
 - Administrator/root privileges for most live-capture configurations.
 - Scapy, installed from `requirements.txt`.
