@@ -422,7 +422,7 @@ they are not mandatory:
 - **Replay a captured lab PCAP:** capture once in an isolated lab, then use
   offline analysis for repeatable tests and demonstrations.
 
-## Troubleshooting
+# 4. Troubleshooting
 
 ### No interfaces are listed
 
@@ -474,7 +474,7 @@ the rule is enabled. Deduplication and the alert suppression window can also
 reduce repeated alerts. Inspect the JSON report for the rule counters instead
 of relying only on terminal output.
 
-## Known Limitations and False-Positive Scenarios
+# 5. Known Limitations and False-Positive Scenarios
 
 NetSentinel is a focused, packet-based detector rather than a full enterprise
 SIEM or endpoint detection platform. Important limitations include:
@@ -516,7 +516,7 @@ Treat an alert as a lead for investigation, not proof of compromise. Tune
 thresholds, exclusions, trusted ARP mappings, and baseline data using known
 normal traffic before using alerts for operational decisions.
 
-## Ethical and Authorized-Use Statement
+# 6. Ethical and Authorized-Use Statement
 
 NetSentinel must be used only for systems, networks, and packet captures that
 you own or for which you have explicit, documented authorization. Before
@@ -537,7 +537,7 @@ disruption, privacy violations, or unauthorized monitoring. If a test begins
 to affect an out-of-scope system, stop it immediately and notify the
 appropriate owner.
 
-## Future Improvements
+# 7. Future Improvements
 
 Potential improvements, in priority order, include:
 
