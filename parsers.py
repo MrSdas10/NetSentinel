@@ -340,20 +340,22 @@ def _parse_dns_layer(pkt: object, p: ParsedPacket, DNS: type) -> None:
 
     # Extract the first question name and type.
     try:
-        qdcount = getattr(dns, "qdcount", 0) or 0
         qd = getattr(dns, "qd", None)
-        if qdcount > 0 and qd is not None:
-            name = getattr(qd, "qname", None)
-            if name is not None:
-                # Scapy may return bytes; decode safely.
-                if isinstance(name, bytes):
-                    name = name.decode("utf-8", errors="replace").rstrip(".")
-                else:
-                    name = str(name).rstrip(".")
-                p.dns_query_name = name if name else None
+        if qd is not None:
+            if isinstance(qd, (list, tuple)) and qd:
+                qd = qd[0]
+            if qd is not None:
+                name = getattr(qd, "qname", None)
+                if name is not None:
+                    # Scapy may return bytes or a packet-list-like wrapper; decode safely.
+                    if isinstance(name, (bytes, bytearray)):
+                        name = bytes(name).decode("utf-8", errors="replace").rstrip(".")
+                    else:
+                        name = str(name).rstrip(".")
+                    p.dns_query_name = name if name else None
 
-            qtype = getattr(qd, "qtype", None)
-            p.dns_query_type = _safe_int(qtype)
+                qtype = getattr(qd, "qtype", None)
+                p.dns_query_type = _safe_int(qtype)
     except Exception as exc:
         logger.debug("DNS question parse error: %s", exc)
 

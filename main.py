@@ -30,6 +30,8 @@ import sys
 import time
 from pathlib import Path
 
+from runtime_logger import configure_runtime_logging
+
 # ---------------------------------------------------------------------------
 # Project root — all relative paths are resolved from here.
 # ---------------------------------------------------------------------------
@@ -103,6 +105,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--show-config",
         action="store_true",
         help="Display the loaded configuration and exit.",
+    )
+    mode.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Generate a historical NetSentinel dashboard from saved reports and alerts.",
+    )
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose packet-level logging to the runtime log file.",
     )
 
     # Capture options
@@ -237,6 +250,14 @@ def cmd_show_config(config_path: Path) -> int:
         return obj
 
     print(json.dumps(_to_dict(config), indent=2))
+    return EXIT_OK
+
+
+def cmd_visualize(project_root: Path) -> int:
+    from dashboard import generate_dashboard
+
+    output_path = generate_dashboard(project_root, open_browser=False)
+    print(f"[*] Historical dashboard generated: {output_path}")
     return EXIT_OK
 
 
@@ -421,16 +442,24 @@ def main() -> int:
     _bootstrap_logging(args.log_level or "INFO")
 
     logger = logging.getLogger("main")
+    runtime_log_path = configure_runtime_logging(PROJECT_ROOT, verbose=args.verbose)
+    logger.info("NetSentinel startup on %s; runtime log file: %s", PROJECT_ROOT, runtime_log_path)
 
     # Load configuration.
     config_path = Path(args.config).expanduser().resolve()
 
     # Commands that don't need a full valid config.
     if args.list_interfaces:
+        logger.info("Listing interfaces.")
         return cmd_list_interfaces()
 
     if args.show_config:
+        logger.info("Displaying configuration from %s.", config_path)
         return cmd_show_config(config_path)
+
+    if args.visualize:
+        logger.info("Generating historical dashboard from stored reports.")
+        return cmd_visualize(PROJECT_ROOT)
 
     # All other commands require a valid config.
     from config_loader import load_config, ConfigError
@@ -445,6 +474,7 @@ def main() -> int:
         config.logging.level = args.log_level
     _bootstrap_logging(config.logging.level)
     _configure_file_logging(config)
+    logger.info("Loaded configuration from %s; mode=%s", config_path, "live" if args.interface else "offline")
 
     # Validate: --duration only makes sense with --interface.
     if args.duration and not args.interface:
